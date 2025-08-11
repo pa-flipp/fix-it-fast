@@ -64,8 +64,28 @@ class PRFix:
             self._publish_final("No eligible files to fix (check allowlist/blocklist and size limits).")
             return
 
-        # Build prompt
+        # If configured, try Aider CLI to apply fixes directly, then synthesize diff
+        use_aider = bool(get_settings().get("pr_fix", {}).get("use_aider", False))
+        if use_aider:
+            ok, aider_patch, aider_err = self._run_aider(files_ctx)
+            if not ok:
+                self._publish_final(f"Aider failed: {aider_err}")
+                return
+            okv, verr = self._dry_run_patch(aider_patch)
+            if not okv:
+                self._publish_final(f"Patch failed to apply in dry-run: {verr}")
+                return
+            summary = self._build_summary(0.99, "aider-applied fix", files_ctx)
+            comment = summary + "\n\n```diff\n" + aider_patch + "\n```\n\n"
+            comment += "> Safe mode (Aider): posting patch as diff. Branch/PR delivery to follow."
+            self._publish_final(comment)
+            return
+
+        # Render prompts and call model
         system_prompt, user_prompt = self._render_prompts(files_ctx)
+
+        # Build prompt
+        # system_prompt, user_prompt = self._render_prompts(files_ctx)
 
         # Call LLM with retry and parse JSON
         try:
@@ -129,6 +149,64 @@ class PRFix:
         comment = summary + "\n\n```diff\n" + synthesized_patch + "\n```\n\n"
         comment += "> Safe mode: posting patch as diff. Branch/PR delivery to follow."
         self._publish_final(comment)
+
+    def _run_aider(self, files_ctx: list[dict]) -> tuple[bool, str | None, str | None]:
+        """
+        Invoke Aider CLI non-interactively to apply minimal fixes to the listed files.
+        Returns (ok, synthesized_unified_diff, error)
+        """
+        try:
+            import shutil
+        except Exception:
+            pass
+        aider_exe = shutil.which("aider") if 'shutil' in globals() else None
+        if not aider_exe:
+            return False, None, "aider CLI not found in PATH. Ensure aider-chat is installed."
+
+        # Build instruction from context
+        title = self.git_provider.get_title()
+        desc = self.git_provider.get_pr_description()
+        review_text = ""
+        if bool(get_settings().get("pr_fix", {}).get("use_review_context", True)):
+            try:
+                prev = self.git_provider.get_previous_review(full=True, incremental=False)
+                if prev and getattr(prev, "body", ""):
+                    review_text = prev.body
+            except Exception:
+                pass
+
+        files = [f.get("path") for f in files_ctx if isinstance(f, dict) and f.get("path")]
+        files = files[: int(get_settings().get("pr_fix", {}).get("max_files", 10))]
+        instruction = (
+            "You are to make the smallest safe changes to address obvious correctness issues. "
+            "Do not modify tests or CI/infra files. Only edit the listed files.\n\n"
+            f"PR Title: {title}\n\nPR Description:\n{desc}\n\n"
+            + (f"Reviewer findings:\n{review_text}\n\n" if review_text else "")
+            + "Constraints:\n- Keep changes minimal and deterministic.\n- Avoid speculative behavior changes.\n"
+        )
+
+        # Run aider with a single message and target files
+        try:
+            msg_arg = ["--message", instruction]
+            cmd = [aider_exe, "--yes"] + msg_arg + files
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                return False, None, (proc.stderr or proc.stdout or "aider failed").strip()
+        except Exception as e:
+            return False, None, str(e)
+
+        # Capture unified diff after aider modifications
+        try:
+            proc2 = subprocess.run(["git", "diff"], capture_output=True, text=True)
+            diff = proc2.stdout.strip()
+            if not diff:
+                return False, None, "aider produced no changes"
+            # Ensure newline
+            if not diff.endswith("\n"):
+                diff += "\n"
+            return True, diff, None
+        except Exception as e:
+            return False, None, str(e)
 
     def _build_patch_from_edits(self, edits: Any, context_files: list[dict]) -> tuple[bool, str | None, str | None]:
         """

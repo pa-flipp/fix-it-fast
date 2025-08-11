@@ -8,6 +8,8 @@ runs:
         python-version: '3.12'
     - run: |
         python -m pip install --upgrade pip
+        # Install aider for Aider-backed /fix flow
+        pip install aider-chat
         # Install this action's dependencies and package from the action directory,
         # not from the caller repository working directory.
         pip install -r "$GITHUB_ACTION_PATH/requirements.txt"
