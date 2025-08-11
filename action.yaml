@@ -8,8 +8,11 @@ runs:
         python-version: '3.12'
     - run: |
         python -m pip install --upgrade pip
-        # Install aider for Aider-backed /fix flow
-        pip install aider-chat
+        # Install aider in an isolated virtualenv to avoid dependency conflicts
+        python -m venv "$RUNNER_TEMP/aider-venv"
+        "$RUNNER_TEMP/aider-venv/bin/pip" install --upgrade pip
+        "$RUNNER_TEMP/aider-venv/bin/pip" install aider-chat
+        echo "$RUNNER_TEMP/aider-venv/bin" >> "$GITHUB_PATH"
         # Install this action's dependencies and package from the action directory,
         # not from the caller repository working directory.
         pip install -r "$GITHUB_ACTION_PATH/requirements.txt"

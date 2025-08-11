@@ -189,7 +189,13 @@ class PRFix:
         try:
             msg_arg = ["--message", instruction]
             cmd = [aider_exe, "--yes"] + msg_arg + files
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            # Prepare environment for Aider (map OPENAI_KEY -> OPENAI_API_KEY, ANTHROPIC_KEY -> ANTHROPIC_API_KEY)
+            env = os.environ.copy()
+            if "OPENAI_API_KEY" not in env and env.get("OPENAI_KEY"):
+                env["OPENAI_API_KEY"] = env["OPENAI_KEY"]
+            if "ANTHROPIC_API_KEY" not in env and env.get("ANTHROPIC_KEY"):
+                env["ANTHROPIC_API_KEY"] = env["ANTHROPIC_KEY"]
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
             if proc.returncode != 0:
                 return False, None, (proc.stderr or proc.stdout or "aider failed").strip()
         except Exception as e:
