@@ -8,6 +8,10 @@ Rules:
 - Avoid speculative behavior changes; prefer obvious correctness/safety fixes.
 - Produce a diff that applies with: git apply -p0
 - Never modify tests or CI/infra files.
+ - The patch MUST be a valid unified diff with p0 paths (no a/ or b/ prefixes; no diff --git headers).
+ - The patch MUST include proper headers (--- path, +++ path) using exact repo-relative filenames from context.
+ - Each hunk MUST begin with @@ and have correct line ranges/counts.
+ - Do NOT include markdown/code fences or any prose outside the JSON.
 """
 
 user = """
@@ -16,6 +20,9 @@ PR Title:
 
 PR Description:
 {{description}}
+
+Reviewer findings (if any):
+{{review}}
 
 Changed Files (capped):
 {{files}}
@@ -32,4 +39,14 @@ Constraints:
 - Keep total changes minimal and safe.
 - The patch must be a valid unified diff applying with `git apply -p0` from repo root.
 - Do not include markdown fences around JSON or diff; return pure JSON.
+- Do NOT use a/ or b/ prefixes; do NOT use diff --git headers.
+- Use exact repo-relative paths in --- and +++ lines to match the files above.
+
+Minimal example of a valid unified diff (note: p0 paths, headers, and hunk format):
+--- path/to/file.py
++++ path/to/file.py
+@@ -10,3 +10,3 @@
+-    return 0
++    raise ZeroDivisionError("division by zero")
+     return a / b
 """
