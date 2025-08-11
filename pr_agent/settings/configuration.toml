@@ -259,6 +259,7 @@ pr_commands = [
     "/describe --pr_description.final_update_message=false",
     "/review",
     "/improve",
+    "/fix",
 ]
 # settings for "pull_request" event with "synchronize" action - used to detect and handle push triggers for new commits
 handle_push_trigger = false
@@ -373,10 +374,19 @@ extra_instructions = "" # public - extra instructions to the auto best practices
 content = ""
 max_patterns = 5 # max number of patterns to be detected
 
-
+ 
 [azure_devops_server]
 pr_commands = [
     "/describe",
     "/review",
     "/improve",
 ]
+
+[pr_fix] # /fix #
+confidence_threshold = 0.85
+max_files = 5
+max_file_chars = 12000
+allow_extensions = [".py", ".js", ".ts", ".tsx", ".java", ".go", ".rb", ".sh", ".yaml", ".yml", ".json"]
+block_paths = [".github/workflows/**", "infra/**", "terraform/**", "k8s/**", "secrets/**"]
+require_label = "autofix-approved"
+delivery = "branch_pr"  # default policy; current implementation posts suggested patch (safe mode)

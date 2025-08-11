@@ -19,6 +19,7 @@ def set_parser():
     - cli.py --pr_url=... review
     - cli.py --pr_url=... describe
     - cli.py --pr_url=... improve
+    - cli.py --pr_url=... fix
     - cli.py --pr_url=... ask "write me a poem about this PR"
     - cli.py --pr_url=... reflect
     - cli.py --issue_url=... similar_issue
@@ -33,6 +34,8 @@ def set_parser():
 
     - improve / improve_code - Suggest improvements to the code in the PR as pull request comments ready to commit.
     Extended mode ('improve --extended') employs several calls, and provides a more thorough feedback
+
+    - fix - Propose a minimal, safe patch for the PR according to FixItFast policy. Requires the 'autofix-approved' label.
 
     - reflect - Ask the PR author questions about the PR.
 
