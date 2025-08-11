@@ -197,15 +197,29 @@ class PRFix:
     def _render_prompts(self, files_ctx: List[Dict[str, Any]]):
         title = self.git_provider.pr.title if getattr(self.git_provider, 'pr', None) else ""
         desc = self.git_provider.get_pr_description() if hasattr(self.git_provider, 'get_pr_description') else ""
+        # Optionally include prior review as guidance
+        use_review = bool(get_settings().get("pr_fix", {}).get("use_review_context", True))
+        review_text = ""
+        if use_review:
+            try:
+                prev = self.git_provider.get_previous_review(full=True, incremental=False)
+                review_text = prev.body if prev else ""
+            except Exception:
+                review_text = ""
         vars = {
             "title": title,
             "description": desc,
             "files": files_ctx,
+            "review": review_text,
         }
         system = get_settings().get("pr_fix_prompt", {}).get("system", "You are a code-fixing assistant.")
         user = get_settings().get("pr_fix_prompt", {}).get("user", "")
         # Very light templating
         user_rendered = user.replace("{{title}}", title or "").replace("{{description}}", desc or "")
+        if use_review:
+            user_rendered = user_rendered.replace("{{review}}", review_text or "")
+        else:
+            user_rendered = user_rendered.replace("{{review}}", "")
         files_blob = "\n\n".join([f"# {f['path']}\n{f['content']}" for f in files_ctx])
         user_rendered = user_rendered.replace("{{files}}", files_blob)
         return system, user_rendered
@@ -217,17 +231,56 @@ class PRFix:
         return resp, finish
 
     def _dry_run_patch(self, patch: str) -> tuple[bool, str | None]:
-        # Write patch to temp file and run git apply --check -p0
+        # Sanitize patch and validate with git apply --check. Try -p0, then fallback to -p1
         try:
-            with tempfile.TemporaryDirectory() as td:
-                patch_path = os.path.join(td, "fix.patch")
-                with open(patch_path, "w", encoding="utf-8") as f:
-                    f.write(patch)
-                cmd = ["git", "apply", "--check", "-p0", patch_path]
-                proc = subprocess.run(cmd, capture_output=True, text=True)
-                if proc.returncode != 0:
-                    return False, proc.stderr.strip() or proc.stdout.strip()
-            return True, None
+            # 1) Sanitize: strip code fences/backticks and extra prose
+            p = patch.strip()
+            # remove ```diff ... ``` or ``` ... ``` fences if present
+            if p.startswith("```"):
+                # drop leading fence line
+                first_nl = p.find("\n")
+                if first_nl != -1:
+                    p = p[first_nl + 1 :]
+            if p.endswith("```"):
+                p = p[: -3].rstrip()
+            # strip possible JSON escaping artifacts
+            p = p.replace("\r\n", "\n").replace("\r", "\n")
+            # remove byte-order mark
+            if p and p[0] == "\ufeff":
+                p = p.lstrip("\ufeff")
+            # ensure trailing newline (git apply can be picky)
+            if not p.endswith("\n"):
+                p += "\n"
+
+            # Heuristic: detect a/ b/ path prefixes or diff --git headers
+            has_ab_prefix = False
+            for line in p.splitlines()[:10]:
+                if line.startswith("diff --git") or line.startswith("--- a/") or line.startswith("+++ b/"):
+                    has_ab_prefix = True
+                    break
+
+            def attempt(patch_text: str, strip_level: str) -> tuple[bool, str | None]:
+                with tempfile.TemporaryDirectory() as td:
+                    patch_path = os.path.join(td, "fix.patch")
+                    with open(patch_path, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(patch_text)
+                    cmd = ["git", "apply", "--check", strip_level, patch_path]
+                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                    if proc.returncode == 0:
+                        return True, None
+                    return False, (proc.stderr or proc.stdout or "patch apply failed").strip()
+
+            # Try -p0 first
+            ok, err = attempt(p, "-p0")
+            if ok:
+                return True, None
+            # Fallback to -p1 if patch seems to use a/ b/ prefixes
+            if has_ab_prefix:
+                ok2, err2 = attempt(p, "-p1")
+                if ok2:
+                    return True, None
+                return False, f"-p0 failed: {err}; -p1 failed: {err2}"
+            return False, err
         except Exception as e:
             return False, str(e)
 
