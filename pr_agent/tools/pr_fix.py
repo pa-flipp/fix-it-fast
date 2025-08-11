@@ -108,7 +108,7 @@ class PRFix:
 
         synthesized_patch = None
         if edits:
-            ok_build, synthesized_patch, build_err = self._build_patch_from_edits(edits)
+            ok_build, synthesized_patch, build_err = self._build_patch_from_edits(edits, files_ctx)
             if not ok_build:
                 self._publish_final(f"Failed to build patch from edits: {build_err}")
                 return
@@ -130,7 +130,7 @@ class PRFix:
         comment += "> Safe mode: posting patch as diff. Branch/PR delivery to follow."
         self._publish_final(comment)
 
-    def _build_patch_from_edits(self, edits: Any) -> tuple[bool, str | None, str | None]:
+    def _build_patch_from_edits(self, edits: Any, context_files: list[dict]) -> tuple[bool, str | None, str | None]:
         """
         Build a unified diff (p0 paths) from structured edits.
         Supported minimal schema per edit:
@@ -147,13 +147,21 @@ class PRFix:
 
         updated_files: dict[str, str] = {}
         original_files: dict[str, str] = {}
+        context_map: dict[str, str] = {f.get("path"): f.get("content", "") for f in (context_files or []) if isinstance(f, dict) and f.get("path")}
 
         def read_file(path: str) -> tuple[bool, str | None]:
+            # Prefer disk if available; fallback to context_map (files from PR provider)
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     return True, f.read()
-            except Exception as e:
-                return False, str(e)
+            except Exception:
+                if path in context_map:
+                    return True, context_map[path]
+                # also try stripping leading './'
+                alt = path[2:] if path.startswith("./") else None
+                if alt and alt in context_map:
+                    return True, context_map[alt]
+                return False, f"[Errno 2] No such file or directory: '{path}'"
 
         # Apply edits in-memory
         for i, e in enumerate(edits):
