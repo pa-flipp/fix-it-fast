@@ -137,6 +137,14 @@ class PRFix:
             return False
 
     def _is_authorized_commenter(self) -> bool:
+        # If association requirement is disabled, allow any commenter.
+        try:
+            require = bool(get_settings().get("pr_fix", {}).get("require_association", False))
+        except Exception:
+            require = False
+        if not require:
+            return True
+        # Otherwise enforce allowed associations (MEMBER/OWNER/COLLABORATOR)
         try:
             assoc = getattr(self.git_provider.pr, "author_association", "NONE")
             return assoc in ALLOWED_ASSOCIATIONS
