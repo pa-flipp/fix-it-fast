@@ -97,28 +97,127 @@ class PRFix:
 
         confidence = float(payload.get("confidence", 0))
         rationale = str(payload.get("rationale", ""))
-        patch = str(payload.get("patch", "")).strip()
+        # Prefer ops-based edits if provided; fall back to raw patch
+        edits = payload.get("edits")
+        patch = str(payload.get("patch", "")).strip() if not edits else ""
 
         th = float(get_settings().get("pr_fix", {}).get("confidence_threshold", 0.85))
         if confidence < th:
             self._publish_final(f"Proposed fix confidence {confidence:.2f} is below threshold {th:.2f}. Aborting.")
             return
 
-        if not patch:
-            self._publish_final("Model did not provide a patch.")
-            return
+        synthesized_patch = None
+        if edits:
+            ok_build, synthesized_patch, build_err = self._build_patch_from_edits(edits)
+            if not ok_build:
+                self._publish_final(f"Failed to build patch from edits: {build_err}")
+                return
+        else:
+            if not patch:
+                self._publish_final("Model did not provide a patch.")
+                return
+            synthesized_patch = patch
 
         # Validate patch applies (dry-run)
-        ok, err = self._dry_run_patch(patch)
+        ok, err = self._dry_run_patch(synthesized_patch)
         if not ok:
             self._publish_final(f"Patch failed to apply in dry-run: {err}")
             return
 
         # For MVP, publish safe-mode comment with patch + summary
         summary = self._build_summary(confidence, rationale, files_ctx)
-        comment = summary + "\n\n```diff\n" + patch + "\n```\n\n"
+        comment = summary + "\n\n```diff\n" + synthesized_patch + "\n```\n\n"
         comment += "> Safe mode: posting patch as diff. Branch/PR delivery to follow."
         self._publish_final(comment)
+
+    def _build_patch_from_edits(self, edits: Any) -> tuple[bool, str | None, str | None]:
+        """
+        Build a unified diff (p0 paths) from structured edits.
+        Supported minimal schema per edit:
+          { "path": str, "type": "replace_snippet", "old": str, "new": str }
+        Returns (ok, patch, error)
+        """
+        try:
+            import difflib
+        except Exception as e:
+            return False, None, f"missing difflib: {e}"
+
+        if not isinstance(edits, list):
+            return False, None, "'edits' must be a list"
+
+        updated_files: dict[str, str] = {}
+        original_files: dict[str, str] = {}
+
+        def read_file(path: str) -> tuple[bool, str | None]:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return True, f.read()
+            except Exception as e:
+                return False, str(e)
+
+        # Apply edits in-memory
+        for i, e in enumerate(edits):
+            if not isinstance(e, dict):
+                return False, None, f"edit #{i} is not an object"
+            path = e.get("path")
+            etype = e.get("type")
+            if not path or not etype:
+                return False, None, f"edit #{i} missing 'path' or 'type'"
+            okr, content_or_err = read_file(path)
+            if not okr:
+                return False, None, f"cannot read {path}: {content_or_err}"
+            current = content_or_err  # type: ignore[assignment]
+            original_files.setdefault(path, current)
+
+            if etype == "replace_snippet":
+                old = e.get("old")
+                new = e.get("new")
+                if old is None or new is None:
+                    return False, None, f"edit #{i} replace_snippet requires 'old' and 'new'"
+                if old not in current:
+                    return False, None, f"edit #{i} old snippet not found in {path}"
+                updated = current.replace(old, new, 1)
+                updated_files[path] = updated
+            elif etype == "replace_line_range":
+                start = e.get("start_line")
+                end = e.get("end_line")
+                new = e.get("new")
+                if not isinstance(start, int) or not isinstance(end, int) or new is None:
+                    return False, None, f"edit #{i} replace_line_range requires int start_line/end_line and 'new'"
+                lines = current.splitlines()
+                if start < 1 or end < start or end > len(lines) + 1:
+                    return False, None, f"edit #{i} invalid line range for {path}"
+                before = lines[: start - 1]
+                after = lines[end - 1 :]
+                new_lines = new.splitlines()
+                updated = "\n".join(before + new_lines + after)
+                updated_files[path] = updated
+            else:
+                return False, None, f"edit #{i} unsupported type: {etype}"
+
+        # Build unified diff across edited files
+        patches: list[str] = []
+        for path, new_content in updated_files.items():
+            old_content = original_files.get(path, "")
+            old_lines = old_content.splitlines(keepends=True)
+            new_lines = new_content.splitlines(keepends=True)
+            # Use path as-is (p0 paths)
+            ud = difflib.unified_diff(
+                old_lines, new_lines,
+                fromfile=path, tofile=path,
+                lineterm=""
+            )
+            diff_text = "\n".join(list(ud))
+            if diff_text:
+                patches.append(diff_text)
+
+        full_patch = "\n".join(patches)
+        if not full_patch.strip():
+            return False, None, "no changes produced by edits"
+        # Ensure trailing newline for git apply
+        if not full_patch.endswith("\n"):
+            full_patch += "\n"
+        return True, full_patch, None
 
     def _publish_final(self, msg: str):
         try:
