@@ -159,13 +159,19 @@ class PRFix:
             import shutil
         except Exception:
             pass
-        aider_exe = shutil.which("aider") if 'shutil' in globals() else None
+        
+        # First check for environment variable (GitHub Actions)
+        aider_exe = os.environ.get("AIDER_EXECUTABLE")
         if not aider_exe:
-            return False, None, "aider CLI not found in PATH. Ensure aider-chat is installed."
+            # Fallback to PATH search
+            aider_exe = shutil.which("aider") if 'shutil' in globals() else None
+        
+        if not aider_exe or not os.path.exists(aider_exe):
+            return False, None, "aider CLI not found. Ensure aider-chat is installed or AIDER_EXECUTABLE is set."
 
         # Build instruction from context
-        title = self.git_provider.get_title()
-        desc = self.git_provider.get_pr_description()
+        title = getattr(self.git_provider.pr, 'title', '') if hasattr(self.git_provider, 'pr') else ''
+        desc = self.git_provider.get_pr_description() if hasattr(self.git_provider, 'get_pr_description') else ''
         review_text = ""
         if bool(get_settings().get("pr_fix", {}).get("use_review_context", True)):
             try:
