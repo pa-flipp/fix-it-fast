@@ -315,35 +315,115 @@ class PRFix:
         
         return instruction
     
+    def _get_review_data_directly(self) -> dict:
+        """
+        Get structured review data directly from the PR reviewer instead of parsing text.
+        Returns the structured review data or empty dict if not available.
+        """
+        try:
+            # Import here to avoid circular imports
+            from pr_agent.tools.pr_reviewer import PRReviewer
+            from pr_agent.algo.utils import load_yaml
+            
+            # Create a PR reviewer instance to get the structured data
+            reviewer = PRReviewer(self.git_provider.pr_url)
+            
+            # Get the previous review data if it exists
+            prev_review = self.git_provider.get_previous_review(full=True, incremental=False)
+            if not prev_review or not hasattr(prev_review, 'body') or not prev_review.body:
+                return {}
+            
+            # Try to extract the YAML data from the review comment
+            # The review comment contains structured data that we can parse
+            review_body = prev_review.body
+            
+            # Look for the structured data section (usually between --- markers or in code blocks)
+            import re
+            yaml_match = re.search(r'```yaml\n(.*?)\n```', review_body, re.DOTALL)
+            if not yaml_match:
+                # Try to find YAML-like structure in the review
+                yaml_match = re.search(r'review:\s*\n(.*?)(?:\n\n|\n---|\Z)', review_body, re.DOTALL)
+            
+            if yaml_match:
+                yaml_content = yaml_match.group(1)
+                try:
+                    # Parse the YAML content
+                    data = load_yaml(f"review:\n{yaml_content}")
+                    return data.get('review', {})
+                except Exception as e:
+                    get_logger().debug(f"Failed to parse YAML from review: {e}")
+            
+            return {}
+            
+        except Exception as e:
+            get_logger().debug(f"Failed to get review data directly: {e}")
+            return {}
+
     def _extract_actionable_issues(self, review_text: str) -> list[str]:
         """
-        Extract specific, actionable issues from review text.
+        Extract specific, actionable issues from PR review data.
+        First tries to get structured data directly, then falls back to text parsing.
         """
+        issues = []
+        
+        # First, try to get structured review data directly
+        review_data = self._get_review_data_directly()
+        
+        if review_data and 'key_issues_to_review' in review_data:
+            # Extract issues from structured data
+            key_issues = review_data['key_issues_to_review']
+            if isinstance(key_issues, list):
+                for issue in key_issues:
+                    if isinstance(issue, dict):
+                        # Handle structured issue format
+                        title = issue.get('title', issue.get('issue', ''))
+                        description = issue.get('description', issue.get('suggestion', ''))
+                        if title and description:
+                            issues.append(f"{title}: {description}")
+                        elif title:
+                            issues.append(title)
+                    elif isinstance(issue, str):
+                        issues.append(issue)
+        
+        # Also check for security concerns
+        if review_data and 'security_concerns' in review_data:
+            security_concerns = review_data['security_concerns']
+            if isinstance(security_concerns, list):
+                for concern in security_concerns:
+                    if isinstance(concern, dict):
+                        title = concern.get('title', 'Security Issue')
+                        description = concern.get('description', concern.get('concern', ''))
+                        if description:
+                            issues.append(f"{title}: {description}")
+                    elif isinstance(concern, str) and concern.strip():
+                        issues.append(f"Security Issue: {concern}")
+        
+        # If we got structured data, return it
+        if issues:
+            get_logger().info(f"Extracted {len(issues)} issues from structured review data")
+            return issues[:5]  # Limit to 5 most important
+        
+        # Fallback to text parsing if no structured data available
+        get_logger().info("No structured review data found, falling back to text parsing")
         if not review_text:
             return []
         
-        issues = []
+        # Simple fallback parsing for key problem indicators
+        lines = review_text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if any(keyword in line.lower() for keyword in 
+                  ['error', 'exception', 'bug', 'issue', 'problem', 'missing', 'invalid', 'incorrect',
+                   'vulnerability', 'security', 'leak', 'fail']):
+                if len(line) > 10 and len(line) < 200 and not line.startswith('#'):
+                    # Clean up the line
+                    clean_line = line.replace('```', '').replace('`', '').strip()
+                    if clean_line:
+                        issues.append(clean_line)
         
-        # Common patterns that indicate actionable issues
-        issue_patterns = [
-            r'(?i)(?:fix|correct|address|resolve)\s+(.+?)(?:\.|$)',
-            r'(?i)(?:bug|error|issue|problem):\s*(.+?)(?:\.|$)',
-            r'(?i)(?:should be|needs to be|must be)\s+(.+?)(?:\.|$)',
-            r'(?i)(?:missing|lacking|without)\s+(.+?)(?:\.|$)',
-            r'(?i)(?:incorrect|wrong|invalid)\s+(.+?)(?:\.|$)',
-            r'(?i)(?:potential|possible)\s+(?:security|vulnerability|leak)\s*(.+?)(?:\.|$)',
-        ]
-        
-        import re
-        for pattern in issue_patterns:
-            matches = re.findall(pattern, review_text, re.MULTILINE | re.DOTALL)
-            for match in matches:
-                clean_issue = match.strip()
-                if clean_issue and len(clean_issue) > 5 and len(clean_issue) < 200:
-                    issues.append(clean_issue)
-        
-        # Limit to most relevant issues
-        return issues[:5]
+        # Remove duplicates and limit
+        unique_issues = list(dict.fromkeys(issues))  # Preserve order while removing duplicates
+        return unique_issues[:5]
 
     def _build_patch_from_edits(self, edits: Any, context_files: list[dict]) -> tuple[bool, str | None, str | None]:
         """
@@ -736,11 +816,15 @@ This PR will be updated as I address your feedback. Each commit represents a rou
 
     def _notify_parent_pr(self, parent_pr_number: int, child_pr_number: int):
         """Add notification comment to parent PR."""
+        # Get the repository URL for proper linking
+        repo_url = self.git_provider.repo_obj.html_url
+        child_pr_url = f"{repo_url}/pull/{child_pr_number}"
+        
         comment = f"""🤖 I've analyzed your PR and created fixes in **PR #{child_pr_number}**
 
 Please review the changes and let me know if you'd like any adjustments!
 
-[View the fixes →](../../pull/{child_pr_number})
+[View the fixes →]({child_pr_url})
 """
         self.git_provider.publish_comment(comment)
 
