@@ -694,8 +694,8 @@ class PRFix:
             title = f"🔧 AI Fixes for PR #{parent_pr_number}"
             body = self._create_child_pr_template(parent_pr_number)
             
-            # Create PR via git provider
-            child_pr = self.git_provider.github_client.pulls.create(
+            # Create PR via repository object (correct GitHub API access)
+            child_pr = self.git_provider.repo_obj.create_pull(
                 title=title,
                 head=fix_branch,
                 base=parent_branch,
@@ -765,7 +765,7 @@ Please review the changes and let me know if you'd like any adjustments!
         """Apply user feedback to child PR by adding commits."""
         try:
             # Get child PR details
-            child_pr = self.git_provider.github_client.pulls.get(child_pr_number)
+            child_pr = self.git_provider.repo_obj.get_pull(child_pr_number)
             fix_branch = child_pr.head.ref
             
             # Checkout the fix branch
@@ -792,11 +792,10 @@ Please review the changes and let me know if you'd like any adjustments!
             subprocess.run(["git", "push", "origin", fix_branch], check=True)
             
             # Add acknowledgment comment
-            self.git_provider.github_client.issues.create_comment(
-                issue_number=child_pr_number,
-                body=f"✅ I've updated the code based on your feedback:\n\n"
-                     f"> {feedback}\n\n"
-                     f"Please review the latest changes!"
+            child_pr.create_issue_comment(
+                f"✅ I've updated the code based on your feedback:\n\n"
+                f"> {feedback}\n\n"
+                f"Please review the latest changes!"
             )
             
             return True
@@ -805,9 +804,9 @@ Please review the changes and let me know if you'd like any adjustments!
             get_logger().exception(f"Failed to apply feedback: {e}")
             # Add error comment
             try:
-                self.git_provider.github_client.issues.create_comment(
-                    issue_number=child_pr_number,
-                    body=f"❌ Sorry, I had trouble processing your feedback: {str(e)}"
+                child_pr = self.git_provider.repo_obj.get_pull(child_pr_number)
+                child_pr.create_issue_comment(
+                    f"❌ Sorry, I had trouble processing your feedback: {str(e)}"
                 )
             except:
                 pass
@@ -870,17 +869,19 @@ Please review the changes and let me know if you'd like any adjustments!
     def _merge_child_pr_to_parent(self, child_pr_number: int) -> bool:
         """Merge child PR back to parent PR."""
         try:
+            # Get child PR object
+            child_pr = self.git_provider.repo_obj.get_pull(child_pr_number)
+            
             # Merge child PR using GitHub API
-            self.git_provider.github_client.pulls.merge(
-                pull_number=child_pr_number,
+            child_pr.merge(
                 merge_method="squash",
                 commit_title="🤖 Apply AI fixes",
                 commit_message="Applied AI-generated fixes after review"
             )
             
             # Clean up fix branch
-            child_pr = self.git_provider.github_client.pulls.get(child_pr_number)
-            self.git_provider.github_client.git.delete_ref(f"heads/{child_pr.head.ref}")
+            branch_ref = f"heads/{child_pr.head.ref}"
+            self.git_provider.repo_obj.get_git_ref(branch_ref).delete()
             
             get_logger().info(f"Successfully merged child PR #{child_pr_number}")
             return True
@@ -889,10 +890,10 @@ Please review the changes and let me know if you'd like any adjustments!
             get_logger().exception(f"Failed to merge child PR: {e}")
             # Add manual merge instructions comment
             try:
-                self.git_provider.github_client.issues.create_comment(
-                    issue_number=child_pr_number,
-                    body=f"❌ I couldn't merge automatically: {str(e)}\n\n"
-                         f"Please merge this PR manually when ready."
+                child_pr = self.git_provider.repo_obj.get_pull(child_pr_number)
+                child_pr.create_issue_comment(
+                    f"❌ I couldn't merge automatically: {str(e)}\n\n"
+                    f"Please merge this PR manually when ready."
                 )
             except:
                 pass
