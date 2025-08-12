@@ -62,11 +62,19 @@ class PRAgent:
         apply_repo_settings(pr_url)
 
         # Then, apply user specific settings if exists
+        # DEBUG: Log what request we're parsing
+        get_logger().info(f"DEBUG: PRAgent received request: '{request}' (type: {type(request)})")
+        
         if isinstance(request, str):
             request = request.replace("'", "\\'")
             lexer = shlex.shlex(request, posix=True)
             lexer.whitespace_split = True
-            action, *args = list(lexer)
+            parsed_tokens = list(lexer)
+            action, *args = parsed_tokens
+            
+            # DEBUG: Log parsing results
+            get_logger().info(f"DEBUG: Parsed tokens: {parsed_tokens}")
+            get_logger().info(f"DEBUG: Action: '{action}', Args: {args}")
         else:
             action, *args = request
 
