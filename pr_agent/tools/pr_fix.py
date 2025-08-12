@@ -184,20 +184,28 @@ class PRFix:
         files = [f.get("path") for f in files_ctx if isinstance(f, dict) and f.get("path")]
         files = files[: int(get_settings().get("pr_fix", {}).get("max_files", 10))]
         
+        # Debug: Show what files are actually on disk vs what we think should exist
+        get_logger().info(f"Working directory: {os.getcwd()}")
+        
+        # List all files in working directory
+        import glob
+        all_files = glob.glob("**/*", recursive=True)
+        get_logger().info(f"All files on disk: {all_files[:20]}...")  # First 20 files
+        
         # Check that files actually exist and are readable
         existing_files = []
         for file_path in files:
+            abs_path = os.path.abspath(file_path)
             if os.path.exists(file_path):
                 existing_files.append(file_path)
                 get_logger().info(f"File exists: {file_path}")
             else:
-                get_logger().warning(f"File does not exist: {file_path}")
+                get_logger().warning(f"File does not exist: {file_path} (abs: {abs_path})")
         
         if not existing_files:
             return False, None, "no files exist to modify"
         
         files = existing_files
-        get_logger().info(f"Working directory: {os.getcwd()}")
         get_logger().info(f"Files for aider: {files}")
         
         # Build specific instruction based on review context and common issues
