@@ -21,6 +21,7 @@ from pr_agent.tools.pr_reviewer import PRReviewer
 from pr_agent.tools.pr_similar_issue import PRSimilarIssue
 from pr_agent.tools.pr_update_changelog import PRUpdateChangelog
 from pr_agent.tools.pr_fix import PRFix
+from pr_agent.tools.pr_issue_fix import PRIssueFix
 
 command2class = {
     "auto_review": PRReviewer,
@@ -43,6 +44,9 @@ command2class = {
     "generate_labels": PRGenerateLabels,
     "help_docs": PRHelpDocs,
     "fix": PRFix,
+    "fix_issue": PRIssueFix,
+    "issue_fix": PRIssueFix,
+    "resolve_issue": PRIssueFix,
 }
 
 commands = list(command2class.keys())

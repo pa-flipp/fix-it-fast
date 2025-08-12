@@ -36,6 +36,8 @@ def set_parser():
     Extended mode ('improve --extended') employs several calls, and provides a more thorough feedback
 
     - fix - Propose a minimal, safe patch for the PR according to FixItFast policy. Requires the 'autofix-approved' label.
+    
+    - fix_issue - Analyze a GitHub issue and create a child PR with AI-generated fixes.
 
     - reflect - Ask the PR author questions about the PR.
 

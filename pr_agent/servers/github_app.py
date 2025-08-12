@@ -121,6 +121,60 @@ async def handle_comments_on_pr(body: Dict[str, Any],
         else:
             get_logger().info(f"User {sender=} is not eligible to process comment on PR {api_url=}")
 
+async def handle_comments_on_issue(body: Dict[str, Any],
+                                   event: str,
+                                   sender: str,
+                                   sender_id: str,
+                                   action: str,
+                                   log_context: Dict[str, Any],
+                                   agent: PRAgent):
+    """Handle comments on GitHub issues (not PRs)."""
+    if "comment" not in body:
+        return {}
+    
+    comment_body = body.get("comment", {}).get("body")
+    if not comment_body or not isinstance(comment_body, str):
+        return {}
+    
+    # Check if comment contains fix_issue commands
+    fix_commands = ['/fix_issue', '/issue_fix', '/resolve_issue']
+    if not any(cmd in comment_body for cmd in fix_commands):
+        get_logger().info("Ignoring issue comment - no fix_issue commands found")
+        return {}
+    
+    # Get the issue URL
+    issue = body.get("issue", {})
+    if not issue:
+        get_logger().error("No issue found in comment webhook")
+        return {}
+    
+    issue_url = issue.get("html_url")
+    if not issue_url:
+        get_logger().error("No issue URL found in webhook")
+        return {}
+    
+    log_context["issue_url"] = issue_url
+    comment_id = body.get("comment", {}).get("id")
+    
+    # Extract the command from the comment
+    command = None
+    for cmd in fix_commands:
+        if cmd in comment_body:
+            command = cmd.lstrip('/')
+            break
+    
+    if not command:
+        return {}
+    
+    provider = get_git_provider_with_context(pr_url=issue_url)
+    with get_logger().contextualize(**log_context):
+        if get_identity_provider().verify_eligibility("github", sender_id, issue_url) is not Eligibility.NOT_ELIGIBLE:
+            get_logger().info(f"Processing {command} command on issue {issue_url=}")
+            await agent.handle_request(issue_url, command,
+                        notify=lambda: provider.add_eyes_reaction(comment_id, disable_eyes=False))
+        else:
+            get_logger().info(f"User {sender=} is not eligible to process issue {issue_url=}")
+
 async def handle_new_pr_opened(body: Dict[str, Any],
                                event: str,
                                sender: str,
@@ -337,10 +391,19 @@ async def handle_request(body: Dict[str, Any], event: str):
     if 'check_run' in body:  # handle failed checks
         # get_logger().debug(f'Request body', artifact=body, event=event) # added inside handle_checks
         pass
-    # handle comments on PRs
+    # handle comments on PRs and issues
     elif action == 'created':
         get_logger().debug(f'Request body', artifact=body, event=event)
-        await handle_comments_on_pr(body, event, sender, sender_id, action, log_context, agent)
+        if event == 'issue_comment':
+            # Check if this is a comment on an issue (not a PR)
+            if "issue" in body and "pull_request" not in body["issue"]:
+                await handle_comments_on_issue(body, event, sender, sender_id, action, log_context, agent)
+            else:
+                # This is a comment on a PR (which also comes as issue_comment event)
+                await handle_comments_on_pr(body, event, sender, sender_id, action, log_context, agent)
+        else:
+            # Other created events (like PR comments from other webhooks)
+            await handle_comments_on_pr(body, event, sender, sender_id, action, log_context, agent)
     # handle new PRs
     elif event == 'pull_request' and action != 'synchronize' and action != 'closed':
         get_logger().debug(f'Request body', artifact=body, event=event)
