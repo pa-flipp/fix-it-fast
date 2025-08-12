@@ -247,13 +247,13 @@ class PRFix:
             get_logger().exception(f"Aider execution failed: {e}")
             return False, None, str(e)
 
-        # Extract complete diff from Aider's commit
+        # Extract diff from aider's commit in proper format for git apply
         try:
-            # Get the commit diff that Aider just made
-            proc = subprocess.run(["git", "show", "--format=", "HEAD"], capture_output=True, text=True)
+            # Get the commit diff that Aider just made, but with --no-prefix for compatibility
+            proc = subprocess.run(["git", "show", "--format=", "--no-prefix", "HEAD"], capture_output=True, text=True)
             commit_diff = proc.stdout.strip()
             
-            get_logger().info(f"Git show HEAD output length: {len(commit_diff)}")
+            get_logger().info(f"Git show HEAD --no-prefix output length: {len(commit_diff)}")
             if commit_diff:
                 get_logger().info(f"Commit diff preview: {commit_diff[:500]}...")
             
