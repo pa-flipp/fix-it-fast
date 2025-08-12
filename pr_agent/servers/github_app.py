@@ -87,6 +87,11 @@ async def handle_comments_on_pr(body: Dict[str, Any],
     if "comment" not in body:
         return {}
     comment_body = body.get("comment", {}).get("body")
+    
+    # DEBUG: Log what comment handler receives
+    get_logger().info(f"DEBUG: handle_comments_on_pr received comment: '{comment_body}'")
+    get_logger().info(f"DEBUG: Comment starts with /: {comment_body.lstrip().startswith('/') if comment_body else False}")
+    
     if comment_body and isinstance(comment_body, str) and not comment_body.lstrip().startswith("/"):
         if '/ask' in comment_body and comment_body.strip().startswith('> ![image]'):
             comment_body_split = comment_body.split('/ask')
@@ -133,6 +138,11 @@ async def handle_comments_on_issue(body: Dict[str, Any],
         return {}
     
     comment_body = body.get("comment", {}).get("body")
+    
+    # DEBUG: Log what issue comment handler receives
+    get_logger().info(f"DEBUG: handle_comments_on_issue received comment: '{comment_body}'")
+    get_logger().info(f"DEBUG: Comment starts with /: {comment_body.lstrip().startswith('/') if comment_body else False}")
+    
     if not comment_body or not isinstance(comment_body, str):
         return {}
     
@@ -373,6 +383,11 @@ async def handle_request(body: Dict[str, Any], event: str):
     """
     action = body.get("action")  # "created", "opened", "reopened", "ready_for_review", "review_requested", "synchronize"
     get_logger().debug(f"Handling request with event: {event}, action: {action}")
+    
+    # DEBUG: Log full webhook payload structure
+    get_logger().info(f"DEBUG: Full webhook payload structure", artifact=body)
+    get_logger().info(f"DEBUG: Event={event}, Action={action}")
+    
     if not action:
         get_logger().debug(f"No action found in request body, exiting handle_request")
         return {}
@@ -395,10 +410,21 @@ async def handle_request(body: Dict[str, Any], event: str):
     elif action == 'created':
         get_logger().debug(f'Request body', artifact=body, event=event)
         if event == 'issue_comment':
+            # DEBUG: Log routing decision criteria
+            has_issue = "issue" in body
+            has_pr_in_issue = "issue" in body and "pull_request" in body["issue"]
+            has_comment = "comment" in body
+            has_comment_pr_url = "comment" in body and "pull_request_url" in body["comment"]
+            
+            get_logger().info(f"DEBUG: Routing decision - has_issue={has_issue}, has_pr_in_issue={has_pr_in_issue}")
+            get_logger().info(f"DEBUG: Routing decision - has_comment={has_comment}, has_comment_pr_url={has_comment_pr_url}")
+            
             # Check if this is a comment on an issue (not a PR)
             if "issue" in body and "pull_request" not in body["issue"]:
+                get_logger().info("DEBUG: Routing to handle_comments_on_issue")
                 await handle_comments_on_issue(body, event, sender, sender_id, action, log_context, agent)
             else:
+                get_logger().info("DEBUG: Routing to handle_comments_on_pr")
                 # This is a comment on a PR (which also comes as issue_comment event)
                 await handle_comments_on_pr(body, event, sender, sender_id, action, log_context, agent)
         else:
