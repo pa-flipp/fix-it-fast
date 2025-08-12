@@ -631,7 +631,8 @@ class PRFix:
         try:
             # Get PR details
             pr_number = self.git_provider.pr.number
-            parent_branch = self.git_provider.pr.base.ref
+            parent_branch = self.git_provider.pr.base.ref  # main/master
+            pr_branch = self.git_provider.pr.head.ref      # feature branch
             
             # Create unique fix branch
             import time
@@ -663,8 +664,8 @@ class PRFix:
             subprocess.run(["git", "commit", "-m", "🤖 Initial AI fixes"], check=True)
             subprocess.run(["git", "push", "origin", fix_branch], check=True)
             
-            # Create child PR
-            child_pr_number = self._create_child_pr(fix_branch, parent_branch, pr_number)
+            # Create child PR pointing to the original PR's branch (not main)
+            child_pr_number = self._create_child_pr(fix_branch, pr_branch, pr_number)
             if not child_pr_number:
                 get_logger().error("Failed to create child PR")
                 return False
