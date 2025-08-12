@@ -247,37 +247,23 @@ class PRFix:
             get_logger().exception(f"Aider execution failed: {e}")
             return False, None, str(e)
 
-        # Capture unified diff after aider modifications
+        # Extract complete diff from Aider's commit
         try:
-            # Check git status first
-            status_proc = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
-            get_logger().info(f"Git status after aider: {status_proc.stdout}")
+            # Get the commit diff that Aider just made
+            proc = subprocess.run(["git", "show", "--format=", "HEAD"], capture_output=True, text=True)
+            commit_diff = proc.stdout.strip()
             
-            # Add all changes (modified + untracked) so we can capture them
-            subprocess.run(["git", "add", "."], capture_output=True, text=True)
+            get_logger().info(f"Git show HEAD output length: {len(commit_diff)}")
+            if commit_diff:
+                get_logger().info(f"Commit diff preview: {commit_diff[:500]}...")
             
-            # Check what was added
-            staged_status_proc = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
-            get_logger().info(f"Git status after git add: {staged_status_proc.stdout}")
-            
-            # Get diff of staged changes (includes both modified files and new content)
-            proc2 = subprocess.run(["git", "diff", "--cached"], capture_output=True, text=True)
-            diff = proc2.stdout.strip()
-            get_logger().info(f"Git diff --cached output length: {len(diff)}")
-            if diff:
-                get_logger().info(f"Git diff preview: {diff[:500]}...")
-            
-            if not diff:
-                # Last resort: try unstaged changes
-                unstaged_proc = subprocess.run(["git", "diff"], capture_output=True, text=True)
-                diff = unstaged_proc.stdout.strip()
-                if not diff:
-                    return False, None, "aider produced no trackable changes"
+            if not commit_diff:
+                return False, None, "aider commit produced no diff"
                     
             # Ensure newline
-            if not diff.endswith("\n"):
-                diff += "\n"
-            return True, diff, None
+            if not commit_diff.endswith("\n"):
+                commit_diff += "\n"
+            return True, commit_diff, None
         except Exception as e:
             get_logger().exception(f"Git diff capture failed: {e}")
             return False, None, str(e)
