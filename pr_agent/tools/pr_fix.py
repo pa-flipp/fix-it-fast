@@ -708,11 +708,15 @@ class PRFix:
             parent_branch = self.git_provider.pr.base.ref  # main/master
             pr_branch = self.git_provider.pr.head.ref      # feature branch
             
-            # Check if this IS already a child PR (branch starts with 'fix-')
-            if pr_branch.startswith('fix-'):
-                get_logger().info(f"Detected /fix command on child PR #{pr_number} (branch: {pr_branch})")
+            # Check if this IS already a child PR (has 'child-pr' label)
+            pr_labels = [label.name for label in self.git_provider.pr.labels]
+            is_child_pr = "child-pr" in pr_labels
+            
+            if is_child_pr:
+                get_logger().info(f"Detected /fix command on child PR #{pr_number} (has child-pr label)")
                 return self._update_existing_child_pr(pr_number, pr_branch)
             
+
             # This is a parent PR - create new child PR
             get_logger().info(f"Detected /fix command on parent PR #{pr_number} (branch: {pr_branch})")
             return self._create_new_child_pr(pr_number, parent_branch, pr_branch)
@@ -841,6 +845,14 @@ class PRFix:
                 body=body,
                 draft=draft_mode
             )
+            
+            # Add child-pr label for robust detection
+            try:
+                child_pr.add_to_labels("child-pr")
+                get_logger().info(f"Added 'child-pr' label to PR #{child_pr.number}")
+            except Exception as e:
+                get_logger().warning(f"Failed to add child-pr label: {e}")
+                # Don't fail the whole operation if labeling fails
             
             return child_pr.number
             

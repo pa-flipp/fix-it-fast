@@ -201,10 +201,14 @@ async def handle_child_pr_comment_if_applicable(event_payload, pr_url: str, comm
         if not pr_number:
             return False
         
-        # Check if this PR is a child PR by looking at the title pattern
-        pr_title = event_payload.get("issue", {}).get("title", "")
-        if not pr_title.startswith("🔧 AI Fixes for PR #"):
+        # Check if this PR is a child PR by looking for the 'child-pr' label
+        pr_labels = [l.get("name", "") for l in event_payload.get("issue", {}).get("labels", [])]
+        is_child_pr = "child-pr" in pr_labels
+        
+        if not is_child_pr:
             return False  # Not a child PR
+        
+        get_logger().info(f"Child PR detected via label for PR #{pr_number}")
         
         get_logger().info(f"Detected child PR comment on PR #{pr_number}: {comment_body[:100]}...")
         

@@ -66,6 +66,11 @@ class PRAgent:
         get_logger().info(f"DEBUG: PRAgent received request: '{request}' (type: {type(request)})")
         
         if isinstance(request, str):
+            # Filter out non-command comments (same logic as webhook handlers)
+            if not request.lstrip().startswith("/"):
+                get_logger().info(f"DEBUG: Ignoring non-command comment: '{request}'")
+                return False
+                
             request = request.replace("'", "\\'")
             lexer = shlex.shlex(request, posix=True)
             lexer.whitespace_split = True
