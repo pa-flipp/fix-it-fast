@@ -230,9 +230,16 @@ class PRFix:
             
             proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
             get_logger().info(f"Aider exit code: {proc.returncode}")
-            get_logger().info(f"Aider stdout: {proc.stdout}")
+            
+            # Log complete Aider output without truncation
+            get_logger().info("=== FULL AIDER STDOUT START ===")
+            get_logger().info(proc.stdout)
+            get_logger().info("=== FULL AIDER STDOUT END ===")
+            
             if proc.stderr:
-                get_logger().info(f"Aider stderr: {proc.stderr}")
+                get_logger().info("=== FULL AIDER STDERR START ===")
+                get_logger().info(proc.stderr)
+                get_logger().info("=== FULL AIDER STDERR END ===")
             
             if proc.returncode != 0:
                 return False, None, (proc.stderr or proc.stdout or "aider failed").strip()
