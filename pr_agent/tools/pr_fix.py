@@ -183,18 +183,14 @@ class PRFix:
 
         files = [f.get("path") for f in files_ctx if isinstance(f, dict) and f.get("path")]
         files = files[: int(get_settings().get("pr_fix", {}).get("max_files", 10))]
-        instruction = (
-            "You are to make the smallest safe changes to address obvious correctness issues. "
-            "Do not modify tests or CI/infra files. Only edit the listed files.\n\n"
-            f"PR Title: {title}\n\nPR Description:\n{desc}\n\n"
-            + (f"Reviewer findings:\n{review_text}\n\n" if review_text else "")
-            + "Constraints:\n- Keep changes minimal and deterministic.\n- Avoid speculative behavior changes.\n"
-        )
-
-        # Run aider with a single message and target files
+        
+        # Build specific instruction based on review context and common issues
+        specific_instruction = self._build_specific_aider_instruction(title, desc, review_text, files_ctx)
+        
+        # Run aider with architect mode and specific instructions
         try:
-            msg_arg = ["--message", instruction]
-            cmd = [aider_exe, "--yes"] + msg_arg + files
+            msg_arg = ["--message", specific_instruction]
+            cmd = [aider_exe, "--yes", "--architect"] + msg_arg + files
             # Prepare environment for Aider (map OPENAI_KEY -> OPENAI_API_KEY, ANTHROPIC_KEY -> ANTHROPIC_API_KEY)
             env = os.environ.copy()
             if "OPENAI_API_KEY" not in env and env.get("OPENAI_KEY"):
@@ -219,6 +215,75 @@ class PRFix:
             return True, diff, None
         except Exception as e:
             return False, None, str(e)
+
+    def _build_specific_aider_instruction(self, title: str, desc: str, review_text: str, files_ctx: list[dict]) -> str:
+        """
+        Build specific, actionable instructions for Aider based on review context and common code issues.
+        """
+        # Extract specific actionable issues from review
+        issues = self._extract_actionable_issues(review_text)
+        
+        if issues:
+            instruction = "Fix the following specific issues identified in the code review:\n\n"
+            for i, issue in enumerate(issues, 1):
+                instruction += f"{i}. {issue}\n"
+            instruction += "\n"
+        else:
+            # Fallback to common code issues when no specific review issues found
+            instruction = "Fix the following types of issues if present in the code:\n\n"
+            instruction += "1. Syntax errors, typos, and undefined variables\n"
+            instruction += "2. Null pointer exceptions and missing null checks\n"
+            instruction += "3. Type mismatches and incorrect casting\n"
+            instruction += "4. Logic bugs that could cause runtime errors\n"
+            instruction += "5. Security vulnerabilities (XSS, injection, etc.)\n"
+            instruction += "6. Resource leaks (unclosed files, connections)\n"
+            instruction += "7. Performance issues (inefficient loops, memory leaks)\n\n"
+        
+        # Add context
+        instruction += f"PR Context:\n"
+        instruction += f"Title: {title}\n"
+        if desc.strip():
+            instruction += f"Description: {desc}\n"
+        
+        # Add constraints
+        instruction += "\nConstraints:\n"
+        instruction += "- Make minimal, safe changes only\n"
+        instruction += "- Do not refactor working code\n"
+        instruction += "- Do not modify tests or CI/infrastructure files\n"
+        instruction += "- Focus on correctness and safety fixes\n"
+        instruction += "- Avoid speculative or stylistic changes\n"
+        
+        return instruction
+    
+    def _extract_actionable_issues(self, review_text: str) -> list[str]:
+        """
+        Extract specific, actionable issues from review text.
+        """
+        if not review_text:
+            return []
+        
+        issues = []
+        
+        # Common patterns that indicate actionable issues
+        issue_patterns = [
+            r'(?i)(?:fix|correct|address|resolve)\s+(.+?)(?:\.|$)',
+            r'(?i)(?:bug|error|issue|problem):\s*(.+?)(?:\.|$)',
+            r'(?i)(?:should be|needs to be|must be)\s+(.+?)(?:\.|$)',
+            r'(?i)(?:missing|lacking|without)\s+(.+?)(?:\.|$)',
+            r'(?i)(?:incorrect|wrong|invalid)\s+(.+?)(?:\.|$)',
+            r'(?i)(?:potential|possible)\s+(?:security|vulnerability|leak)\s*(.+?)(?:\.|$)',
+        ]
+        
+        import re
+        for pattern in issue_patterns:
+            matches = re.findall(pattern, review_text, re.MULTILINE | re.DOTALL)
+            for match in matches:
+                clean_issue = match.strip()
+                if clean_issue and len(clean_issue) > 5 and len(clean_issue) < 200:
+                    issues.append(clean_issue)
+        
+        # Limit to most relevant issues
+        return issues[:5]
 
     def _build_patch_from_edits(self, edits: Any, context_files: list[dict]) -> tuple[bool, str | None, str | None]:
         """
