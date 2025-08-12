@@ -55,6 +55,12 @@ class PRFix:
                 self.git_provider.publish_comment(msg)
             return
 
+        # Try child PR workflow first (hackathon MVP)
+        child_pr_success = self.handle_fix_command()
+        if child_pr_success:
+            return  # Child PR workflow completed successfully
+
+        # Fallback to existing workflow
         if get_settings().config.publish_output:
             self.git_provider.publish_comment("Generating fix patch...", is_temporary=True)
 
@@ -608,3 +614,286 @@ class PRFix:
             f"- Rationale: {rationale}\n"
             f"- Files considered (capped):\n{files_list}\n"
         )
+
+    # ===== CHILD PR WORKFLOW METHODS (Hackathon MVP) =====
+
+    def handle_fix_command(self) -> bool:
+        """
+        Handle /fix command with child PR workflow.
+        Returns True if child PR was created successfully, False otherwise.
+        """
+        # Check if child PR workflow is enabled
+        child_pr_settings = get_settings().get("pr_fix", {}).get("child_pr", {})
+        if not child_pr_settings.get("enabled", False):
+            get_logger().info("Child PR workflow disabled, falling back to standard flow")
+            return False
+
+        try:
+            # Get PR details
+            pr_number = self.git_provider.pr.number
+            parent_branch = self.git_provider.pr.base.ref
+            
+            # Create unique fix branch
+            import time
+            timestamp = int(time.time())
+            fix_branch = f"fix-{pr_number}-{timestamp}"
+            
+            get_logger().info(f"Creating fix branch: {fix_branch}")
+            
+            # Create and checkout fix branch
+            subprocess.run(["git", "checkout", "-b", fix_branch], check=True)
+            
+            # Collect files and run Aider fixes
+            files_ctx = self._collect_changed_files()
+            if not files_ctx:
+                self._publish_final("No eligible files to fix (check allowlist/blocklist and size limits).")
+                return False
+            
+            # Run Aider with architect mode
+            ok, aider_patch, aider_err = self._run_aider(files_ctx)
+            if not ok:
+                get_logger().error(f"Aider failed: {aider_err}")
+                # Cleanup and fallback
+                subprocess.run(["git", "checkout", parent_branch], check=False)
+                subprocess.run(["git", "branch", "-D", fix_branch], check=False)
+                return False
+            
+            # Commit changes
+            subprocess.run(["git", "add", "."], check=True)
+            subprocess.run(["git", "commit", "-m", "🤖 Initial AI fixes"], check=True)
+            subprocess.run(["git", "push", "origin", fix_branch], check=True)
+            
+            # Create child PR
+            child_pr_number = self._create_child_pr(fix_branch, parent_branch, pr_number)
+            if not child_pr_number:
+                get_logger().error("Failed to create child PR")
+                return False
+            
+            # Comment on parent PR
+            self._notify_parent_pr(pr_number, child_pr_number)
+            
+            get_logger().info(f"Successfully created child PR #{child_pr_number}")
+            return True
+            
+        except Exception as e:
+            get_logger().exception(f"Child PR creation failed: {e}")
+            # Try to cleanup
+            try:
+                subprocess.run(["git", "checkout", parent_branch], check=False)
+                subprocess.run(["git", "branch", "-D", fix_branch], check=False)
+            except:
+                pass
+            return False
+
+    def _create_child_pr(self, fix_branch: str, parent_branch: str, parent_pr_number: int) -> int:
+        """Create child PR and return its number, or 0 if failed."""
+        try:
+            child_pr_settings = get_settings().get("pr_fix", {}).get("child_pr", {})
+            draft_mode = child_pr_settings.get("draft_mode", True)
+            
+            title = f"🔧 AI Fixes for PR #{parent_pr_number}"
+            body = self._create_child_pr_template(parent_pr_number)
+            
+            # Create PR via git provider
+            child_pr = self.git_provider.github_client.pulls.create(
+                title=title,
+                head=fix_branch,
+                base=parent_branch,
+                body=body,
+                draft=draft_mode
+            )
+            
+            return child_pr.number
+            
+        except Exception as e:
+            get_logger().exception(f"Failed to create child PR: {e}")
+            return 0
+
+    def _create_child_pr_template(self, parent_pr_number: int) -> str:
+        """Generate child PR template."""
+        return f"""## 🤖 AI-Generated Fixes for PR #{parent_pr_number}
+
+### How This Works
+This PR contains AI-generated improvements to your code. Here's how to use it:
+
+1. **📝 Review the changes** line by line
+2. **💬 Leave comments** if you want modifications  
+3. **✅ Approve when satisfied** - I'll merge it back automatically
+
+### What I Fixed
+I analyzed your PR and applied fixes using Aider with architect mode to address:
+- Code issues identified in the review
+- Common patterns and best practices
+- Syntax errors and type issues
+
+### Conversation Log
+This PR will be updated as I address your feedback. Each commit represents a round of improvements.
+
+---
+🤖 *Generated by FixItFast AI - Let's make your code better together!*
+"""
+
+    def _notify_parent_pr(self, parent_pr_number: int, child_pr_number: int):
+        """Add notification comment to parent PR."""
+        comment = f"""🤖 I've analyzed your PR and created fixes in **PR #{child_pr_number}**
+
+Please review the changes and let me know if you'd like any adjustments!
+
+[View the fixes →](../../pull/{child_pr_number})
+"""
+        self.git_provider.publish_comment(comment)
+
+    def handle_child_pr_comment(self, child_pr_number: int, comment_body: str) -> bool:
+        """
+        Handle comments on child PRs for iterative improvements.
+        Returns True if handled successfully.
+        """
+        try:
+            # Check for approval signals
+            approval_words = ['lgtm', 'looks good', 'approve', 'approved', 'merge']
+            if any(word in comment_body.lower() for word in approval_words):
+                return self._merge_child_pr_to_parent(child_pr_number)
+            
+            # Otherwise, treat as feedback for improvements
+            return self._apply_feedback_to_child_pr(child_pr_number, comment_body)
+            
+        except Exception as e:
+            get_logger().exception(f"Failed to handle child PR comment: {e}")
+            return False
+
+    def _apply_feedback_to_child_pr(self, child_pr_number: int, feedback: str) -> bool:
+        """Apply user feedback to child PR by adding commits."""
+        try:
+            # Get child PR details
+            child_pr = self.git_provider.github_client.pulls.get(child_pr_number)
+            fix_branch = child_pr.head.ref
+            
+            # Checkout the fix branch
+            subprocess.run(["git", "fetch", "origin"], check=True)
+            subprocess.run(["git", "checkout", fix_branch], check=True)
+            
+            # Get files context for Aider
+            files_ctx = self._collect_changed_files()
+            if not files_ctx:
+                return False
+            
+            # Run Aider with specific feedback
+            ok, aider_patch, aider_err = self._run_aider_with_feedback(files_ctx, feedback)
+            if not ok:
+                get_logger().error(f"Aider feedback processing failed: {aider_err}")
+                return False
+            
+            # Commit improvements to same branch
+            subprocess.run(["git", "add", "."], check=True)
+            subprocess.run([
+                "git", "commit", "-m", 
+                f"🤖 Address feedback: {feedback[:50]}..."
+            ], check=True)
+            subprocess.run(["git", "push", "origin", fix_branch], check=True)
+            
+            # Add acknowledgment comment
+            self.git_provider.github_client.issues.create_comment(
+                issue_number=child_pr_number,
+                body=f"✅ I've updated the code based on your feedback:\n\n"
+                     f"> {feedback}\n\n"
+                     f"Please review the latest changes!"
+            )
+            
+            return True
+            
+        except Exception as e:
+            get_logger().exception(f"Failed to apply feedback: {e}")
+            # Add error comment
+            try:
+                self.git_provider.github_client.issues.create_comment(
+                    issue_number=child_pr_number,
+                    body=f"❌ Sorry, I had trouble processing your feedback: {str(e)}"
+                )
+            except:
+                pass
+            return False
+
+    def _run_aider_with_feedback(self, files_ctx: list[dict], feedback: str) -> tuple[bool, str | None, str | None]:
+        """Run Aider with specific user feedback."""
+        try:
+            import shutil
+        except Exception:
+            pass
+        
+        # Get Aider executable
+        aider_exe = os.environ.get("AIDER_EXECUTABLE")
+        if not aider_exe:
+            aider_exe = shutil.which("aider") if 'shutil' in globals() else None
+        
+        if not aider_exe or not os.path.exists(aider_exe):
+            return False, None, "aider CLI not found"
+
+        files = [f.get("path") for f in files_ctx if isinstance(f, dict) and f.get("path")]
+        existing_files = [f for f in files if os.path.exists(f)]
+        
+        if not existing_files:
+            return False, None, "no files exist to modify"
+        
+        # Build instruction from feedback
+        instruction = f"Address the following user feedback:\n\n{feedback}\n\n"
+        instruction += "Make the requested changes while maintaining code quality and existing functionality."
+        
+        try:
+            cmd = [aider_exe, "--yes", "--architect", "--no-auto-commits", "--message", instruction] + existing_files
+            
+            # Prepare environment
+            env = os.environ.copy()
+            if "OPENAI_API_KEY" not in env and env.get("OPENAI_KEY"):
+                env["OPENAI_API_KEY"] = env["OPENAI_KEY"]
+            if "ANTHROPIC_API_KEY" not in env and env.get("ANTHROPIC_KEY"):
+                env["ANTHROPIC_API_KEY"] = env["ANTHROPIC_KEY"]
+            
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            
+            if proc.returncode != 0:
+                return False, None, (proc.stderr or proc.stdout or "aider failed").strip()
+            
+            # Capture changes
+            diff_proc = subprocess.run(["git", "diff", "--no-prefix"], capture_output=True, text=True)
+            if diff_proc.returncode != 0:
+                return False, None, f"failed to capture diff: {diff_proc.stderr}"
+            
+            diff = diff_proc.stdout.strip()
+            if not diff:
+                return False, None, "aider produced no changes"
+            
+            return True, diff, None
+            
+        except Exception as e:
+            return False, None, str(e)
+
+    def _merge_child_pr_to_parent(self, child_pr_number: int) -> bool:
+        """Merge child PR back to parent PR."""
+        try:
+            # Merge child PR using GitHub API
+            self.git_provider.github_client.pulls.merge(
+                pull_number=child_pr_number,
+                merge_method="squash",
+                commit_title="🤖 Apply AI fixes",
+                commit_message="Applied AI-generated fixes after review"
+            )
+            
+            # Clean up fix branch
+            child_pr = self.git_provider.github_client.pulls.get(child_pr_number)
+            self.git_provider.github_client.git.delete_ref(f"heads/{child_pr.head.ref}")
+            
+            get_logger().info(f"Successfully merged child PR #{child_pr_number}")
+            return True
+            
+        except Exception as e:
+            get_logger().exception(f"Failed to merge child PR: {e}")
+            # Add manual merge instructions comment
+            try:
+                self.git_provider.github_client.issues.create_comment(
+                    issue_number=child_pr_number,
+                    body=f"❌ I couldn't merge automatically: {str(e)}\n\n"
+                         f"Please merge this PR manually when ready."
+                )
+            except:
+                pass
+            return False

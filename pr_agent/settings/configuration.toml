@@ -390,3 +390,11 @@ allow_extensions = [".py", ".js", ".ts", ".tsx", ".java", ".go", ".rb", ".sh", "
 block_paths = [".github/workflows/**", "infra/**", "terraform/**", "k8s/**", "secrets/**"]
 require_label = "autofix-approved"
 delivery = "branch_pr"  # default policy; current implementation posts suggested patch (safe mode)
+
+# Child PR workflow settings (hackathon MVP)
+[pr_fix.child_pr]
+enabled = true
+draft_mode = true
+max_active_sessions_per_parent = 1
+auto_cleanup_days = 7
+use_aider = true  # Enable Aider integration for child PR workflow

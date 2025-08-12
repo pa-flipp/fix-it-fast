@@ -12,6 +12,7 @@ from pr_agent.servers.github_app import handle_line_comments
 from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
 from pr_agent.tools.pr_description import PRDescription
 from pr_agent.tools.pr_reviewer import PRReviewer
+from pr_agent.tools.pr_fix import PRFix
 
 
 def is_true(value: Union[str, bool]) -> bool:
@@ -171,13 +172,61 @@ async def run_action():
                     comment_id = event_payload.get("comment", {}).get("id")
                     provider = get_git_provider()(pr_url=url)
                     if is_pr:
-                        await PRAgent().handle_request(
-                            url, body, notify=lambda: provider.add_eyes_reaction(
-                                comment_id, disable_eyes=disable_eyes
+                        # Check if this is a child PR comment (hackathon MVP)
+                        child_pr_handled = await handle_child_pr_comment_if_applicable(event_payload, url, comment_body)
+                        if not child_pr_handled:
+                            # Handle normal PR comments
+                            await PRAgent().handle_request(
+                                url, body, notify=lambda: provider.add_eyes_reaction(
+                                    comment_id, disable_eyes=disable_eyes
+                                )
                             )
-                        )
                     else:
                         await PRAgent().handle_request(url, body)
+
+
+async def handle_child_pr_comment_if_applicable(event_payload, pr_url: str, comment_body: str) -> bool:
+    """
+    Handle child PR comments for the conversational fix workflow.
+    Returns True if this was a child PR comment that was handled, False otherwise.
+    """
+    try:
+        # Check if child PR workflow is enabled
+        child_pr_settings = get_settings().get("pr_fix", {}).get("child_pr", {})
+        if not child_pr_settings.get("enabled", False):
+            return False
+        
+        # Get PR details from the event payload
+        pr_number = event_payload.get("issue", {}).get("number")
+        if not pr_number:
+            return False
+        
+        # Check if this PR is a child PR by looking at the title pattern
+        pr_title = event_payload.get("issue", {}).get("title", "")
+        if not pr_title.startswith("🔧 AI Fixes for PR #"):
+            return False  # Not a child PR
+        
+        get_logger().info(f"Detected child PR comment on PR #{pr_number}: {comment_body[:100]}...")
+        
+        # Initialize PRFix tool to handle the comment
+        pr_fix = PRFix(pr_url)
+        success = pr_fix.handle_child_pr_comment(pr_number, comment_body)
+        
+        if success:
+            get_logger().info(f"Successfully handled child PR comment on PR #{pr_number}")
+        else:
+            get_logger().error(f"Failed to handle child PR comment on PR #{pr_number}")
+        
+        return True  # We handled this as a child PR comment
+        
+    except Exception as e:
+        get_logger().exception(f"Error handling child PR comment: {e}")
+        return False  # Let normal comment handling take over
+
+
+def is_child_pr(pr_title: str) -> bool:
+    """Check if a PR is a child PR based on its title."""
+    return pr_title.startswith("🔧 AI Fixes for PR #")
 
 
 if __name__ == '__main__':
