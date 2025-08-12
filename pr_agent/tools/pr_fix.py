@@ -247,25 +247,58 @@ class PRFix:
             get_logger().exception(f"Aider execution failed: {e}")
             return False, None, str(e)
 
-        # Capture working directory changes after aider (no auto-commits)
+        # Capture working directory changes after aider using stash-based validation
         try:
-            # Get diff of all changes aider made (no-prefix for git apply compatibility)
-            proc = subprocess.run(["git", "diff", "--no-prefix"], capture_output=True, text=True)
-            diff = proc.stdout.strip()
-            
-            get_logger().info(f"Git diff output length: {len(diff)}")
-            if diff:
-                get_logger().info(f"Git diff preview: {diff[:500]}...")
-            
-            if not diff:
+            # Check if there are any changes to stash
+            status_proc = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+            if not status_proc.stdout.strip():
                 return False, None, "aider produced no changes"
+            
+            # Stash changes with descriptive message
+            stash_proc = subprocess.run(
+                ["git", "stash", "push", "-m", "aider-temp-changes"],
+                capture_output=True, text=True
+            )
+            if stash_proc.returncode != 0:
+                return False, None, f"failed to stash changes: {stash_proc.stderr}"
+            
+            try:
+                # Generate patch from stash (working directory now clean)
+                patch_proc = subprocess.run(
+                    ["git", "stash", "show", "-p", "--no-prefix"],
+                    capture_output=True, text=True
+                )
+                if patch_proc.returncode != 0:
+                    return False, None, f"failed to generate patch: {patch_proc.stderr}"
+                
+                diff = patch_proc.stdout.strip()
+                get_logger().info(f"Stash patch output length: {len(diff)}")
+                if diff:
+                    get_logger().info(f"Stash patch preview: {diff[:500]}...")
+                
+                if not diff:
+                    return False, None, "stash contains no changes"
+                        
+                # Ensure newline
+                if not diff.endswith("\n"):
+                    diff += "\n"
                     
-            # Ensure newline
-            if not diff.endswith("\n"):
-                diff += "\n"
-            return True, diff, None
+                # Return patch that can be validated against clean working directory
+                return True, diff, None
+                
+            finally:
+                # Always restore changes, even if patch generation fails
+                pop_proc = subprocess.run(
+                    ["git", "stash", "pop"],
+                    capture_output=True, text=True
+                )
+                if pop_proc.returncode != 0:
+                    get_logger().error(f"Failed to restore stashed changes: {pop_proc.stderr}")
+                    # This is serious - changes are trapped in stash
+                    return False, None, f"changes stashed but failed to restore: {pop_proc.stderr}"
+                    
         except Exception as e:
-            get_logger().exception(f"Git diff capture failed: {e}")
+            get_logger().exception(f"Stash-based diff capture failed: {e}")
             return False, None, str(e)
 
     def _build_specific_aider_instruction(self, title: str, desc: str, review_text: str, files_ctx: list[dict]) -> str:
