@@ -223,12 +223,23 @@ Respond with JSON containing:
             
             get_logger().info(f"Creating fix branch: {fix_branch}")
             
+            # Get repository name from issue URL
+            repo_path, _ = self.git_provider._parse_issue_url(self.issue_url)
+            if not repo_path:
+                get_logger().error("Could not parse repository from issue URL")
+                return False
+            
             # Get default branch for the repo
-            repo_obj = self.git_provider.github_client.get_repo(self.git_provider.repo)
+            repo_obj = self.git_provider.github_client.get_repo(repo_path)
             default_branch = repo_obj.default_branch
             
             # Create and checkout fix branch
-            subprocess.run(["git", "checkout", "-b", fix_branch], check=True)
+            try:
+                result = subprocess.run(["git", "checkout", "-b", fix_branch], capture_output=True, text=True, check=True)
+                get_logger().info(f"Successfully created branch: {fix_branch}")
+            except subprocess.CalledProcessError as e:
+                get_logger().error(f"Failed to create git branch: {e.stderr}")
+                return False
             
             # Generate the fix using Aider
             success = await self._generate_fix_with_aider(analysis, files)
@@ -256,9 +267,8 @@ Respond with JSON containing:
             pr_title = f"🔧 Fix issue #{self.issue.number}: {self.issue.title}"
             pr_body = self._create_pr_body(analysis)
             
-            from github import Github
-            g = self.git_provider.github_client
-            repo = g.get_repo(self.git_provider.repo)
+            # Use the repo object we already have
+            repo = repo_obj
             
             child_pr = repo.create_pull(
                 title=pr_title,
@@ -334,9 +344,12 @@ Files to consider: {', '.join(files)}
             
             if result.returncode == 0:
                 get_logger().info("Aider completed successfully")
+                get_logger().debug(f"Aider stdout: {result.stdout}")
                 return True
             else:
-                get_logger().error(f"Aider failed: {result.stderr}")
+                get_logger().error(f"Aider failed with return code {result.returncode}")
+                get_logger().error(f"Aider stderr: {result.stderr}")
+                get_logger().error(f"Aider stdout: {result.stdout}")
                 return False
 
         except Exception as e:
