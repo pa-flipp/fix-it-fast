@@ -191,29 +191,58 @@ class PRFix:
         try:
             msg_arg = ["--message", specific_instruction]
             cmd = [aider_exe, "--yes", "--architect"] + msg_arg + files
+            
+            # Log what we're trying to do
+            get_logger().info(f"Running aider command: {' '.join(cmd)}")
+            get_logger().info(f"Aider instruction: {specific_instruction[:200]}...")
+            get_logger().info(f"Files to fix: {files}")
+            
             # Prepare environment for Aider (map OPENAI_KEY -> OPENAI_API_KEY, ANTHROPIC_KEY -> ANTHROPIC_API_KEY)
             env = os.environ.copy()
             if "OPENAI_API_KEY" not in env and env.get("OPENAI_KEY"):
                 env["OPENAI_API_KEY"] = env["OPENAI_KEY"]
             if "ANTHROPIC_API_KEY" not in env and env.get("ANTHROPIC_KEY"):
                 env["ANTHROPIC_API_KEY"] = env["ANTHROPIC_KEY"]
+            
             proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            get_logger().info(f"Aider exit code: {proc.returncode}")
+            get_logger().info(f"Aider stdout: {proc.stdout}")
+            if proc.stderr:
+                get_logger().info(f"Aider stderr: {proc.stderr}")
+            
             if proc.returncode != 0:
                 return False, None, (proc.stderr or proc.stdout or "aider failed").strip()
         except Exception as e:
+            get_logger().exception(f"Aider execution failed: {e}")
             return False, None, str(e)
 
         # Capture unified diff after aider modifications
         try:
+            # Check git status first
+            status_proc = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+            get_logger().info(f"Git status after aider: {status_proc.stdout}")
+            
             proc2 = subprocess.run(["git", "diff"], capture_output=True, text=True)
             diff = proc2.stdout.strip()
+            get_logger().info(f"Git diff output length: {len(diff)}")
+            if diff:
+                get_logger().info(f"Git diff preview: {diff[:500]}...")
+            
             if not diff:
-                return False, None, "aider produced no changes"
+                # Check if there are staged changes
+                staged_proc = subprocess.run(["git", "diff", "--cached"], capture_output=True, text=True)
+                if staged_proc.stdout.strip():
+                    get_logger().info("Found staged changes instead of unstaged")
+                    diff = staged_proc.stdout.strip()
+                else:
+                    return False, None, "aider produced no changes (no git diff output)"
+                    
             # Ensure newline
             if not diff.endswith("\n"):
                 diff += "\n"
             return True, diff, None
         except Exception as e:
+            get_logger().exception(f"Git diff capture failed: {e}")
             return False, None, str(e)
 
     def _build_specific_aider_instruction(self, title: str, desc: str, review_text: str, files_ctx: list[dict]) -> str:
