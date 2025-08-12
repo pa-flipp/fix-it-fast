@@ -249,8 +249,8 @@ class PRFix:
 
         # Capture working directory changes after aider (no auto-commits)
         try:
-            # Get diff of all changes aider made
-            proc = subprocess.run(["git", "diff"], capture_output=True, text=True)
+            # Get diff of all changes aider made (no-prefix for git apply compatibility)
+            proc = subprocess.run(["git", "diff", "--no-prefix"], capture_output=True, text=True)
             diff = proc.stdout.strip()
             
             get_logger().info(f"Git diff output length: {len(diff)}")
