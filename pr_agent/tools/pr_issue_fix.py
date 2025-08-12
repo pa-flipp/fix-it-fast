@@ -297,60 +297,62 @@ Please review the changes and provide feedback if you'd like any adjustments!"""
             return False
 
     async def _generate_fix_with_aider(self, analysis: Dict[str, Any], files: List[str]) -> bool:
-        """Generate fix using Aider CLI."""
+        """Generate fix using Aider CLI - mirrors the working pr_fix.py implementation."""
         try:
             import shutil
             
-            # Find Aider executable
+            # Find Aider executable (same as pr_fix.py)
             aider_exe = os.environ.get("AIDER_EXECUTABLE")
             if not aider_exe:
                 aider_exe = shutil.which("aider")
             
-            if not aider_exe:
+            if not aider_exe or not os.path.exists(aider_exe):
                 get_logger().error("Aider CLI not found")
                 return False
             
-            # Build fix instruction
-            fix_instruction = f"""
-Fix this GitHub issue:
-
-ISSUE: {self.issue.title}
-
-DESCRIPTION:
-{self.issue.body or 'No description provided'}
-
-ANALYSIS: {analysis.get('summary', 'Address the reported issue')}
-
-Please make minimal, focused changes to fix the issue. Focus on:
-- Fixing the root cause
-- Adding proper error handling
-- Ensuring code safety
-- Following existing code patterns
-
-Files to consider: {', '.join(files)}
-"""
-
-            # Run Aider
-            cmd = [
-                aider_exe,
-                "--no-auto-commits",
-                "--yes",
-                "--architect",
-                "--message", fix_instruction
-            ] + files
+            # Build concise instruction (like pr_fix.py does)
+            issue_instruction = f"Add missing functionality to fix issue: {self.issue.title}"
+            if analysis.get('summary'):
+                issue_instruction = analysis['summary']
             
-            get_logger().info(f"Running Aider: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            # Use concise message format like the working implementation
+            specific_instruction = f"Fix the following issue:\n\n{issue_instruction}\n\nMake minimal, focused changes following existing code patterns."
             
-            if result.returncode == 0:
-                get_logger().info("Aider completed successfully")
-                get_logger().debug(f"Aider stdout: {result.stdout}")
-                return True
-            else:
-                get_logger().error(f"Aider failed with return code {result.returncode}")
-                get_logger().error(f"Aider stderr: {result.stderr}")
-                get_logger().error(f"Aider stdout: {result.stdout}")
+            # Prepare environment for Aider (CRITICAL - same as pr_fix.py)
+            env = os.environ.copy()
+            if "OPENAI_API_KEY" not in env and env.get("OPENAI_KEY"):
+                env["OPENAI_API_KEY"] = env["OPENAI_KEY"]
+            if "ANTHROPIC_API_KEY" not in env and env.get("ANTHROPIC_KEY"):
+                env["ANTHROPIC_API_KEY"] = env["ANTHROPIC_KEY"]
+            
+            # Mirror exact command structure from pr_fix.py
+            msg_arg = ["--message", specific_instruction]
+            cmd = [aider_exe, "--yes", "--architect", "--no-auto-commits"] + msg_arg + files
+            
+            get_logger().info(f"Running aider command: {' '.join(cmd)}")
+            get_logger().info(f"Aider instruction: {specific_instruction[:200]}...")
+            get_logger().info(f"Files to fix: {files}")
+            
+            # Run without timeout (like pr_fix.py) and with proper environment
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            get_logger().info(f"Aider exit code: {proc.returncode}")
+            
+            # Log output (same as pr_fix.py)
+            get_logger().info("=== FULL AIDER STDOUT START ===")
+            get_logger().info(proc.stdout)
+            get_logger().info("=== FULL AIDER STDOUT END ===")
+            
+            if proc.stderr:
+                get_logger().info("=== FULL AIDER STDERR START ===")
+                get_logger().info(proc.stderr)
+                get_logger().info("=== FULL AIDER STDERR END ===")
+            
+            if proc.returncode != 0:
+                get_logger().error(f"Aider failed: {proc.stderr or proc.stdout}")
                 return False
+            
+            get_logger().info("Aider completed successfully")
+            return True
 
         except Exception as e:
             get_logger().exception(f"Aider execution failed: {e}")
