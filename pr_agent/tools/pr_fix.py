@@ -699,21 +699,31 @@ class PRFix:
 
     def handle_fix_command(self) -> bool:
         """
-        Handle /fix command with child PR workflow.
-        Returns True if child PR was created successfully, False otherwise.
+        Handle /fix command by creating a child PR with AI-generated fixes,
+        or updating an existing child PR if run on one.
+        Returns True if successful, False otherwise.
         """
-        # Check if child PR workflow is enabled
-        child_pr_settings = get_settings().get("pr_fix", {}).get("child_pr", {})
-        if not child_pr_settings.get("enabled", False):
-            get_logger().info("Child PR workflow disabled, falling back to standard flow")
-            return False
-
         try:
-            # Get PR details
             pr_number = self.git_provider.pr.number
             parent_branch = self.git_provider.pr.base.ref  # main/master
             pr_branch = self.git_provider.pr.head.ref      # feature branch
             
+            # Check if this IS already a child PR (branch starts with 'fix-')
+            if pr_branch.startswith('fix-'):
+                get_logger().info(f"Detected /fix command on child PR #{pr_number} (branch: {pr_branch})")
+                return self._update_existing_child_pr(pr_number, pr_branch)
+            
+            # This is a parent PR - create new child PR
+            get_logger().info(f"Detected /fix command on parent PR #{pr_number} (branch: {pr_branch})")
+            return self._create_new_child_pr(pr_number, parent_branch, pr_branch)
+            
+        except Exception as e:
+            get_logger().exception(f"Failed to handle /fix command: {e}")
+            return False
+
+    def _create_new_child_pr(self, pr_number: int, parent_branch: str, pr_branch: str) -> bool:
+        """Create a new child PR for a parent PR."""
+        try:
             # Create unique fix branch
             import time
             timestamp = int(time.time())
@@ -764,6 +774,54 @@ class PRFix:
                 subprocess.run(["git", "branch", "-D", fix_branch], check=False)
             except:
                 pass
+            return False
+
+    def _update_existing_child_pr(self, child_pr_number: int, fix_branch: str) -> bool:
+        """Update an existing child PR with new fixes when /fix is run on it."""
+        try:
+            get_logger().info(f"Updating existing child PR #{child_pr_number} on branch {fix_branch}")
+            
+            # Ensure we're on the correct branch
+            subprocess.run(["git", "fetch", "origin"], check=True)
+            subprocess.run(["git", "checkout", fix_branch], check=True)
+            subprocess.run(["git", "pull", "origin", fix_branch], check=True)
+            
+            # Collect files and run Aider fixes
+            files_ctx = self._collect_changed_files()
+            if not files_ctx:
+                self.git_provider.publish_comment("No eligible files to fix (check allowlist/blocklist and size limits).")
+                return False
+            
+            # Run Aider with architect mode for additional fixes
+            ok, aider_patch, aider_err = self._run_aider(files_ctx)
+            if not ok:
+                get_logger().error(f"Aider failed: {aider_err}")
+                self.git_provider.publish_comment(f"❌ Additional fixes failed: {aider_err}")
+                return False
+            
+            # Check if there are any changes to commit
+            diff_proc = subprocess.run(["git", "diff", "--name-only"], capture_output=True, text=True)
+            if not diff_proc.stdout.strip():
+                self.git_provider.publish_comment("✅ No additional changes needed - the code looks good!")
+                return True
+            
+            # Commit additional changes
+            subprocess.run(["git", "add", "."], check=True)
+            subprocess.run(["git", "commit", "-m", "🤖 Additional AI fixes"], check=True)
+            subprocess.run(["git", "push", "origin", fix_branch], check=True)
+            
+            # Add comment to child PR about the update
+            self.git_provider.publish_comment(
+                "🤖 I've applied additional fixes based on the `/fix` command!\n\n"
+                "The child PR has been updated with new improvements. Please review the latest changes."
+            )
+            
+            get_logger().info(f"Successfully updated child PR #{child_pr_number}")
+            return True
+            
+        except Exception as e:
+            get_logger().exception(f"Failed to update child PR: {e}")
+            self.git_provider.publish_comment(f"❌ Failed to apply additional fixes: {str(e)}")
             return False
 
     def _create_child_pr(self, fix_branch: str, parent_branch: str, parent_pr_number: int) -> int:
