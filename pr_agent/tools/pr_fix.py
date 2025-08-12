@@ -211,10 +211,10 @@ class PRFix:
         # Build specific instruction based on review context and common issues
         specific_instruction = self._build_specific_aider_instruction(title, desc, review_text, files_ctx)
         
-        # Run aider with architect mode and specific instructions
+        # Run aider with architect mode, no auto-commits, and specific instructions
         try:
             msg_arg = ["--message", specific_instruction]
-            cmd = [aider_exe, "--yes", "--architect"] + msg_arg + files
+            cmd = [aider_exe, "--yes", "--architect", "--no-auto-commits"] + msg_arg + files
             
             # Log what we're trying to do
             get_logger().info(f"Running aider command: {' '.join(cmd)}")
@@ -247,23 +247,23 @@ class PRFix:
             get_logger().exception(f"Aider execution failed: {e}")
             return False, None, str(e)
 
-        # Extract diff from aider's commit in proper format for git apply
+        # Capture working directory changes after aider (no auto-commits)
         try:
-            # Get the commit diff that Aider just made, but with --no-prefix for compatibility
-            proc = subprocess.run(["git", "show", "--format=", "--no-prefix", "HEAD"], capture_output=True, text=True)
-            commit_diff = proc.stdout.strip()
+            # Get diff of all changes aider made
+            proc = subprocess.run(["git", "diff"], capture_output=True, text=True)
+            diff = proc.stdout.strip()
             
-            get_logger().info(f"Git show HEAD --no-prefix output length: {len(commit_diff)}")
-            if commit_diff:
-                get_logger().info(f"Commit diff preview: {commit_diff[:500]}...")
+            get_logger().info(f"Git diff output length: {len(diff)}")
+            if diff:
+                get_logger().info(f"Git diff preview: {diff[:500]}...")
             
-            if not commit_diff:
-                return False, None, "aider commit produced no diff"
+            if not diff:
+                return False, None, "aider produced no changes"
                     
             # Ensure newline
-            if not commit_diff.endswith("\n"):
-                commit_diff += "\n"
-            return True, commit_diff, None
+            if not diff.endswith("\n"):
+                diff += "\n"
+            return True, diff, None
         except Exception as e:
             get_logger().exception(f"Git diff capture failed: {e}")
             return False, None, str(e)
