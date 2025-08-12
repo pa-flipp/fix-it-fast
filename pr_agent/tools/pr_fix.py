@@ -184,6 +184,22 @@ class PRFix:
         files = [f.get("path") for f in files_ctx if isinstance(f, dict) and f.get("path")]
         files = files[: int(get_settings().get("pr_fix", {}).get("max_files", 10))]
         
+        # Check that files actually exist and are readable
+        existing_files = []
+        for file_path in files:
+            if os.path.exists(file_path):
+                existing_files.append(file_path)
+                get_logger().info(f"File exists: {file_path}")
+            else:
+                get_logger().warning(f"File does not exist: {file_path}")
+        
+        if not existing_files:
+            return False, None, "no files exist to modify"
+        
+        files = existing_files
+        get_logger().info(f"Working directory: {os.getcwd()}")
+        get_logger().info(f"Files for aider: {files}")
+        
         # Build specific instruction based on review context and common issues
         specific_instruction = self._build_specific_aider_instruction(title, desc, review_text, files_ctx)
         
@@ -222,20 +238,26 @@ class PRFix:
             status_proc = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
             get_logger().info(f"Git status after aider: {status_proc.stdout}")
             
-            proc2 = subprocess.run(["git", "diff"], capture_output=True, text=True)
+            # Add all changes (modified + untracked) so we can capture them
+            subprocess.run(["git", "add", "."], capture_output=True, text=True)
+            
+            # Check what was added
+            staged_status_proc = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+            get_logger().info(f"Git status after git add: {staged_status_proc.stdout}")
+            
+            # Get diff of staged changes (includes both modified files and new content)
+            proc2 = subprocess.run(["git", "diff", "--cached"], capture_output=True, text=True)
             diff = proc2.stdout.strip()
-            get_logger().info(f"Git diff output length: {len(diff)}")
+            get_logger().info(f"Git diff --cached output length: {len(diff)}")
             if diff:
                 get_logger().info(f"Git diff preview: {diff[:500]}...")
             
             if not diff:
-                # Check if there are staged changes
-                staged_proc = subprocess.run(["git", "diff", "--cached"], capture_output=True, text=True)
-                if staged_proc.stdout.strip():
-                    get_logger().info("Found staged changes instead of unstaged")
-                    diff = staged_proc.stdout.strip()
-                else:
-                    return False, None, "aider produced no changes (no git diff output)"
+                # Last resort: try unstaged changes
+                unstaged_proc = subprocess.run(["git", "diff"], capture_output=True, text=True)
+                diff = unstaged_proc.stdout.strip()
+                if not diff:
+                    return False, None, "aider produced no trackable changes"
                     
             # Ensure newline
             if not diff.endswith("\n"):
