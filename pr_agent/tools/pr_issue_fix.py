@@ -278,6 +278,19 @@ Respond with JSON containing:
                 draft=True  # Start as draft
             )
             
+            # Add special labels for child PR workflow
+            try:
+                special_labels = ["autofix-approved", "ai-generated", "child-pr"]
+                for label in special_labels:
+                    try:
+                        child_pr.add_to_labels(label)
+                        get_logger().info(f"Added label '{label}' to child PR #{child_pr.number}")
+                    except Exception as label_error:
+                        # Label might not exist in repo - create it or skip
+                        get_logger().warning(f"Could not add label '{label}': {label_error}")
+            except Exception as e:
+                get_logger().warning(f"Failed to add special labels to child PR: {e}")
+            
             # Comment on the issue
             issue_comment = f"""🤖 I've analyzed this issue and created a potential fix in **PR #{child_pr.number}**
 
@@ -315,8 +328,12 @@ Please review the changes and provide feedback if you'd like any adjustments!"""
             if analysis.get('summary'):
                 issue_instruction = analysis['summary']
             
-            # Use concise message format like the working implementation
-            specific_instruction = f"Fix the following issue:\n\n{issue_instruction}\n\nMake minimal, focused changes following existing code patterns."
+            # Use concise message format like the working implementation  
+            specific_instruction = f"""Fix the following issue:
+
+{issue_instruction}
+
+Make minimal, focused changes while ensuring existing code maintains its functionality. Follow existing code patterns and conventions."""
             
             # Prepare environment for Aider (CRITICAL - same as pr_fix.py)
             env = os.environ.copy()
@@ -374,11 +391,24 @@ Please review the changes and provide feedback if you'd like any adjustments!"""
 ### Original Issue
 > {self.issue.title}
 
-### How to Review
+### 🔄 Child PR Workflow
+This is an **AI-generated Child PR** with special workflow capabilities:
+
+**Need improvements?** 
+- Comment `/fix` to refine the solution automatically
+- Comment `/review` for detailed code analysis  
+- Comment `/improve` for suggested enhancements
+
+**Ready to merge?**
+- Remove the `draft` status when satisfied
+- Normal approval process applies for final merge
+
+### How to Review & Iterate
 1. 📝 **Review the changes** line by line using GitHub's review interface
-2. 💬 **Comment on specific lines** if you want modifications
-3. 🔄 **Add general comments** for broader changes
-4. ✅ **Approve when satisfied**
+2. 💬 **Comment on issues you find** (e.g., "Calculator class is missing", "Logic error in line 45")
+3. 🤖 **Comment `/fix`** to have AI automatically address your feedback
+4. 🔄 **Repeat steps 2-3** until satisfied with the solution
+5. ✅ **Remove draft status** when ready for final approval
 
 ### Testing
 Please test the changes to ensure they resolve the issue without introducing regressions.
