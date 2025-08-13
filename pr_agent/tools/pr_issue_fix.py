@@ -55,6 +55,29 @@ class PRIssueFix:
             files = self._discover_relevant_files(analysis)
             if not files:
                 get_logger().error("No relevant files found for issue")
+                # Inform user about the issue
+                try:
+                    self.issue.create_comment(
+                        f" **Unable to locate relevant files for this issue**\n\n"
+                        f"**Issue Analysis:**\n"
+                        f"- **Type:** {analysis.get('issue_type', 'Unknown')}\n"
+                        f"- **Confidence:** {analysis.get('confidence', 0):.0%}\n"
+                        f"- **Summary:** {analysis.get('summary', 'No summary available')}\n\n"
+                        f"**Problem:** I couldn't find the files mentioned in the issue description in this repository.\n\n"
+                        f"**Possible reasons:**\n"
+                        f"- The file paths mentioned don't exist in this repository\n"
+                        f"- The files might be in a different repository\n"
+                        f"- The paths might have changed since the issue was created\n"
+                        f"- The repository structure might be different than expected\n\n"
+                        f"**Please help by:**\n"
+                        f"- Verifying the correct file paths in this repository\n"
+                        f"- Updating the issue description with accurate paths\n"
+                        f"- Checking if this issue belongs to a different repository\n"
+                        f"- Providing more specific file names or directories to investigate\n\n"
+                        f"Once you provide the correct file paths, I'll be happy to analyze and fix the performance issue! "
+                    )
+                except Exception as comment_err:
+                    get_logger().error(f"Failed to add no-files-found comment: {comment_err}")
                 return
 
             # Create child PR with fix
@@ -167,17 +190,29 @@ Respond with JSON containing:
                 if self._is_valid_code_file(file_path):
                     files.append(file_path)
             
-            # Strategy 2: Search for files with matching keywords
+            # Strategy 2: LLM-powered directory discovery for large repos
             if len(files) < 3:  # Need more files
-                keyword_files = self._find_files_by_keywords(keywords)
+                relevant_dirs = self._discover_relevant_directories(analysis, keywords)
+                if relevant_dirs:
+                    # Search only in relevant directories
+                    keyword_files = self._find_files_by_keywords_in_dirs(keywords, relevant_dirs)
+                else:
+                    # Fallback to global search
+                    keyword_files = self._find_files_by_keywords(keywords)
                 files.extend(keyword_files)
             
             # Limit to max files and apply safety filters
             max_files = 5  # Hackathon limit
             files = files[:max_files]
             
-            # Filter by allowed extensions (reuse from PR workflow)
-            allowed_extensions = ['.py', '.js', '.ts', '.tsx', '.java', '.go', '.rs', '.cpp', '.c', '.rb', '.php']
+            # Filter by allowed extensions (enhanced for more languages)
+            allowed_extensions = [
+                '.py', '.js', '.ts', '.tsx', '.jsx',           # Web/Python
+                '.java', '.scala', '.sbt', '.gradle',         # JVM languages  
+                '.go', '.rs', '.cpp', '.c', '.h',             # Systems languages
+                '.rb', '.php', '.swift', '.kt',               # Other languages
+                '.sql', '.yaml', '.yml', '.json', '.toml'     # Config files
+            ]
             filtered_files = []
             for file_path in files:
                 if any(file_path.endswith(ext) for ext in allowed_extensions):
@@ -193,25 +228,217 @@ Respond with JSON containing:
 
     def _is_valid_code_file(self, file_path: str) -> bool:
         """Check if file path looks like a valid code file."""
-        code_extensions = ['.py', '.js', '.ts', '.tsx', '.java', '.go', '.rs', '.cpp', '.c', '.rb', '.php', '.scala', '.kt']
+        # Use the same comprehensive list as in file discovery
+        code_extensions = [
+            '.py', '.js', '.ts', '.tsx', '.jsx',           # Web/Python
+            '.java', '.scala', '.sbt', '.gradle',         # JVM languages  
+            '.go', '.rs', '.cpp', '.c', '.h',             # Systems languages
+            '.rb', '.php', '.swift', '.kt',               # Other languages
+            '.sql', '.yaml', '.yml', '.json', '.toml'     # Config files
+        ]
         return any(file_path.endswith(ext) for ext in code_extensions)
 
     def _find_files_by_keywords(self, keywords: List[str]) -> List[str]:
-        """Find files containing keywords (simple implementation)."""
+        """Find files containing keywords with fuzzy matching (Aider best practice)."""
         try:
             import glob
             files = []
             
-            # Search for files containing keywords in their names
+            # Enhanced keyword search with multiple strategies
             for keyword in keywords:
-                pattern = f"**/*{keyword}*"
+                keyword_lower = keyword.lower()
+                
+                # Strategy 1: Exact keyword match
+                pattern = f"**/*{keyword_lower}*"
                 matches = glob.glob(pattern, recursive=True)
-                for match in matches:
-                    if self._is_valid_code_file(match) and os.path.isfile(match):
-                        files.append(match)
+                files.extend(matches)
+                
+                # Strategy 2: Keyword without underscores/hyphens
+                clean_keyword = keyword_lower.replace('_', '').replace('-', '')
+                if clean_keyword != keyword_lower:
+                    pattern = f"**/*{clean_keyword}*"
+                    matches = glob.glob(pattern, recursive=True)
+                    files.extend(matches)
+                
+                # Strategy 3: Split compound keywords
+                if '_' in keyword_lower or '-' in keyword_lower:
+                    parts = keyword_lower.replace('-', '_').split('_')
+                    for part in parts:
+                        if len(part) > 2:  # Skip very short parts
+                            pattern = f"**/*{part}*"
+                            matches = glob.glob(pattern, recursive=True)
+                            files.extend(matches)
             
-            return list(set(files))  # Remove duplicates
-        except Exception:
+            # Filter and validate files
+            valid_files = []
+            for match in files:
+                if self._is_valid_code_file(match) and os.path.isfile(match):
+                    valid_files.append(match)
+            
+            return list(set(valid_files))  # Remove duplicates
+        except Exception as e:
+            get_logger().warning(f"Keyword file search failed: {e}")
+            return []
+
+    def _discover_relevant_directories(self, analysis: Dict[str, Any], keywords: List[str]) -> List[str]:
+        """Use LLM to intelligently discover relevant directories in large repos."""
+        try:
+            # Get repository structure (top-level and some key subdirectories)
+            repo_structure = self._get_repository_structure()
+            if not repo_structure:
+                return []
+
+            # Prepare LLM prompt for directory discovery
+            issue_context = f"Issue: {self.issue.title}\nDescription: {self.issue.body or 'No description'}"
+            keywords_str = ", ".join(keywords[:10])  # Limit keywords for prompt
+            
+            prompt = f"""
+Analyze this repository structure and identify the most relevant directories for this issue:
+
+ISSUE CONTEXT:
+{issue_context}
+
+KEYWORDS: {keywords_str}
+
+REPOSITORY STRUCTURE:
+{repo_structure}
+
+Based on the issue description and keywords, identify the 3-5 most relevant directory paths where the related code is likely located.
+
+Respond with JSON containing:
+{{
+    "relevant_directories": ["path1", "path2", "path3"],
+    "reasoning": "brief explanation of why these directories are relevant"
+}}
+"""
+
+            # Call LLM for directory analysis
+            ai_handler = LiteLLMAIHandler()
+            
+            response = ai_handler.chat_completion(
+                model="gpt-4o-mini",  # Use faster model for directory discovery
+                system="You are an expert at analyzing repository structures and finding relevant code locations. Always respond with valid JSON.",
+                user=prompt,
+                temperature=0.1
+            )
+            
+            # Parse LLM response
+            import json
+            try:
+                result = json.loads(response)
+                directories = result.get("relevant_directories", [])
+                reasoning = result.get("reasoning", "")
+                
+                get_logger().info(f"LLM directory discovery: {directories} - {reasoning}")
+                
+                # Validate directories exist
+                valid_dirs = []
+                for dir_path in directories:
+                    if os.path.isdir(dir_path):
+                        valid_dirs.append(dir_path)
+                
+                return valid_dirs
+                
+            except json.JSONDecodeError:
+                get_logger().warning("Failed to parse LLM directory response")
+                return []
+                
+        except Exception as e:
+            get_logger().warning(f"LLM directory discovery failed: {e}")
+            return []
+
+    def _get_repository_structure(self, max_depth: int = 3) -> str:
+        """Get a concise view of repository structure for LLM analysis."""
+        try:
+            import os
+            structure_lines = []
+            
+            def add_directory(path, depth=0, max_items=10):
+                if depth > max_depth:
+                    return
+                
+                indent = "  " * depth
+                items = []
+                
+                try:
+                    for item in sorted(os.listdir(path)):
+                        if item.startswith('.'):
+                            continue
+                        item_path = os.path.join(path, item)
+                        if os.path.isdir(item_path):
+                            items.append((item, True))
+                        elif depth < 2 and any(item.endswith(ext) for ext in ['.py', '.js', '.java', '.scala', '.go']):
+                            items.append((item, False))
+                
+                    # Limit items to avoid overwhelming the LLM
+                    for i, (item, is_dir) in enumerate(items[:max_items]):
+                        if is_dir:
+                            structure_lines.append(f"{indent}{item}/")
+                            if depth < max_depth:
+                                add_directory(os.path.join(path, item), depth + 1, 5)
+                        else:
+                            structure_lines.append(f"{indent}{item}")
+                    
+                    if len(items) > max_items:
+                        structure_lines.append(f"{indent}... ({len(items) - max_items} more items)")
+                        
+                except PermissionError:
+                    structure_lines.append(f"{indent}[Permission denied]")
+            
+            structure_lines.append("Repository Structure:")
+            add_directory(".", 0)
+            
+            return "\n".join(structure_lines[:100])  # Limit total lines
+            
+        except Exception as e:
+            get_logger().warning(f"Failed to get repository structure: {e}")
+            return ""
+
+    def _find_files_by_keywords_in_dirs(self, keywords: List[str], directories: List[str]) -> List[str]:
+        """Search for files by keywords within specific directories."""
+        try:
+            import glob
+            files = []
+            
+            for directory in directories:
+                if not os.path.isdir(directory):
+                    continue
+                    
+                # Search within this specific directory
+                for keyword in keywords:
+                    keyword_lower = keyword.lower()
+                    
+                    # Search patterns within the directory
+                    patterns = [
+                        f"{directory}/**/*{keyword_lower}*",
+                        f"{directory}/**/*{keyword_lower.replace('_', '')}*",
+                        f"{directory}/**/*{keyword_lower.replace('-', '')}*"
+                    ]
+                    
+                    for pattern in patterns:
+                        matches = glob.glob(pattern, recursive=True)
+                        files.extend(matches)
+                        
+                    # Also search split keywords
+                    if '_' in keyword_lower or '-' in keyword_lower:
+                        parts = keyword_lower.replace('-', '_').split('_')
+                        for part in parts:
+                            if len(part) > 2:
+                                pattern = f"{directory}/**/*{part}*"
+                                matches = glob.glob(pattern, recursive=True)
+                                files.extend(matches)
+            
+            # Filter and validate files
+            valid_files = []
+            for match in files:
+                if self._is_valid_code_file(match) and os.path.isfile(match):
+                    valid_files.append(match)
+            
+            get_logger().info(f"Found {len(valid_files)} files in targeted directories: {directories}")
+            return list(set(valid_files))  # Remove duplicates
+            
+        except Exception as e:
+            get_logger().warning(f"Targeted directory search failed: {e}")
             return []
 
     async def _create_issue_fix_pr(self, analysis: Dict[str, Any], files: List[str]) -> bool:

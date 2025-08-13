@@ -936,6 +936,23 @@ Please review the changes and let me know if you'd like any adjustments!
             ok, aider_patch, aider_err = self._run_aider_with_feedback(files_ctx, feedback)
             if not ok:
                 get_logger().error(f"Aider feedback processing failed: {aider_err}")
+                # Inform user about the issue
+                try:
+                    child_pr.create_issue_comment(
+                        f"⚠️ I had trouble processing your feedback: **{feedback}**\n\n"
+                        f"**Issue:** {aider_err or 'No changes were generated'}\n\n"
+                        f"**Possible reasons:**\n"
+                        f"- The requested change may already be implemented\n"
+                        f"- The feedback might need to be more specific\n"
+                        f"- The files might not be found or accessible\n\n"
+                        f"**Please try:**\n"
+                        f"- Being more specific about which file/line to change\n"
+                        f"- Providing a different type of feedback\n"
+                        f"- Running `/fix` again to regenerate the PR\n\n"
+                        f"Feel free to provide more detailed feedback and I'll try again! 🤖"
+                    )
+                except Exception as comment_err:
+                    get_logger().error(f"Failed to add error comment: {comment_err}")
                 return False
             
             # Commit improvements to same branch
@@ -989,8 +1006,10 @@ Please review the changes and let me know if you'd like any adjustments!
             return False, None, "no files exist to modify"
         
         # Build instruction from feedback
-        instruction = f"Address the following user feedback:\n\n{feedback}\n\n"
-        instruction += "Make the requested changes while maintaining code quality and existing functionality."
+        instruction = f"User feedback: {feedback}\n\n"
+        instruction += "Please make the requested changes to the code. "
+        instruction += "Be specific and thorough in addressing the feedback. "
+        instruction += "Maintain code quality and existing functionality."
         
         try:
             cmd = [aider_exe, "--yes", "--architect", "--no-auto-commits", "--message", instruction] + existing_files
