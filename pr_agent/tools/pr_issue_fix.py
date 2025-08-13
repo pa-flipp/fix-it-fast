@@ -52,7 +52,7 @@ class PRIssueFix:
                 get_logger().error("Failed to analyze issue")
                 return
 
-            files = self._discover_relevant_files(analysis)
+            files = await self._find_relevant_files(analysis, analysis.get('keywords', []))
             if not files:
                 get_logger().error("No relevant files found for issue")
                 # Inform user about the issue
@@ -175,52 +175,41 @@ Respond with JSON containing:
             "keywords": keywords + potential_files
         }
 
-    def _discover_relevant_files(self, analysis: Dict[str, Any]) -> List[str]:
-        """Find relevant files for the issue."""
+    async def _find_relevant_files(self, analysis: dict, keywords: list[str]) -> list[str]:
+        """Find relevant files for the issue using LLM intelligence."""
         try:
             files = []
-            keywords = analysis.get('keywords', [])
             
-            # Strategy 1: Look for explicit file mentions in issue
+            # Strategy 1: Look for explicit file mentions in issue (only exact matches)
             issue_text = self.issue.title + " " + (self.issue.body or "")
-            file_pattern = r'\b[\w/.-]+\.\w+\b'
+            file_pattern = r'\b[\w/.-]+\.[a-zA-Z]{1,4}\b'
             potential_files = re.findall(file_pattern, issue_text)
             
             for file_path in potential_files:
-                if self._is_valid_code_file(file_path):
+                if os.path.exists(file_path) and self._is_valid_code_file(file_path):
                     files.append(file_path)
+                    get_logger().info(f"Found explicitly mentioned file: {file_path}")
             
-            # Strategy 2: LLM-powered directory discovery for large repos
-            if len(files) < 3:  # Need more files
-                relevant_dirs = self._discover_relevant_directories(analysis, keywords)
-                if relevant_dirs:
-                    # Search only in relevant directories
-                    keyword_files = self._find_files_by_keywords_in_dirs(keywords, relevant_dirs)
-                else:
-                    # Fallback to global search
-                    keyword_files = self._find_files_by_keywords(keywords)
-                files.extend(keyword_files)
+            # Strategy 2: LLM-powered intelligent file discovery
+            llm_files = await self._discover_relevant_files_with_llm(analysis)
+            if llm_files:
+                files.extend(llm_files)
+                get_logger().info(f"LLM discovered {len(llm_files)} relevant files")
             
-            # Limit to max files and apply safety filters
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_files = []
+            for f in files:
+                if f not in seen:
+                    seen.add(f)
+                    unique_files.append(f)
+            
+            # Limit to max files for safety
             max_files = 5  # Hackathon limit
-            files = files[:max_files]
+            unique_files = unique_files[:max_files]
             
-            # Filter by allowed extensions (enhanced for more languages)
-            allowed_extensions = [
-                '.py', '.js', '.ts', '.tsx', '.jsx',           # Web/Python
-                '.java', '.scala', '.sbt', '.gradle',         # JVM languages  
-                '.go', '.rs', '.cpp', '.c', '.h',             # Systems languages
-                '.rb', '.php', '.swift', '.kt',               # Other languages
-                '.sql', '.yaml', '.yml', '.json', '.toml'     # Config files
-            ]
-            filtered_files = []
-            for file_path in files:
-                if any(file_path.endswith(ext) for ext in allowed_extensions):
-                    if os.path.exists(file_path):
-                        filtered_files.append(file_path)
-            
-            get_logger().info(f"Found {len(filtered_files)} relevant files: {filtered_files}")
-            return filtered_files
+            get_logger().info(f"Final file selection: {unique_files}")
+            return unique_files
 
         except Exception as e:
             get_logger().exception(f"File discovery failed: {e}")
@@ -238,113 +227,83 @@ Respond with JSON containing:
         ]
         return any(file_path.endswith(ext) for ext in code_extensions)
 
-    def _find_files_by_keywords(self, keywords: List[str]) -> List[str]:
-        """Find files containing keywords with fuzzy matching (Aider best practice)."""
+
+
+    async def _discover_relevant_files_with_llm(self, analysis: dict) -> list[str]:
+        """Use LLM to intelligently discover relevant files for the issue."""
         try:
-            import glob
-            files = []
+            from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
             
-            # Enhanced keyword search with multiple strategies
-            for keyword in keywords:
-                keyword_lower = keyword.lower()
-                
-                # Strategy 1: Exact keyword match
-                pattern = f"**/*{keyword_lower}*"
-                matches = glob.glob(pattern, recursive=True)
-                files.extend(matches)
-                
-                # Strategy 2: Keyword without underscores/hyphens
-                clean_keyword = keyword_lower.replace('_', '').replace('-', '')
-                if clean_keyword != keyword_lower:
-                    pattern = f"**/*{clean_keyword}*"
-                    matches = glob.glob(pattern, recursive=True)
-                    files.extend(matches)
-                
-                # Strategy 3: Split compound keywords
-                if '_' in keyword_lower or '-' in keyword_lower:
-                    parts = keyword_lower.replace('-', '_').split('_')
-                    for part in parts:
-                        if len(part) > 2:  # Skip very short parts
-                            pattern = f"**/*{part}*"
-                            matches = glob.glob(pattern, recursive=True)
-                            files.extend(matches)
-            
-            # Filter and validate files
-            valid_files = []
-            for match in files:
-                if self._is_valid_code_file(match) and os.path.isfile(match):
-                    valid_files.append(match)
-            
-            return list(set(valid_files))  # Remove duplicates
-        except Exception as e:
-            get_logger().warning(f"Keyword file search failed: {e}")
-            return []
-
-    def _discover_relevant_directories(self, analysis: Dict[str, Any], keywords: List[str]) -> List[str]:
-        """Use LLM to intelligently discover relevant directories in large repos."""
-        try:
-            # Get repository structure (top-level and some key subdirectories)
-            repo_structure = self._get_repository_structure()
-            if not repo_structure:
-                return []
-
-            # Prepare LLM prompt for directory discovery
-            issue_context = f"Issue: {self.issue.title}\nDescription: {self.issue.body or 'No description'}"
-            keywords_str = ", ".join(keywords[:10])  # Limit keywords for prompt
-            
-            prompt = f"""
-Analyze this repository structure and identify the most relevant directories for this issue:
-
-ISSUE CONTEXT:
-{issue_context}
-
-KEYWORDS: {keywords_str}
-
-REPOSITORY STRUCTURE:
-{repo_structure}
-
-Based on the issue description and keywords, identify the 3-5 most relevant directory paths where the related code is likely located.
-
-Respond with JSON containing:
-{{
-    "relevant_directories": ["path1", "path2", "path3"],
-    "reasoning": "brief explanation of why these directories are relevant"
-}}
-"""
-
-            # Call LLM for directory analysis
             ai_handler = LiteLLMAIHandler()
             
-            response = ai_handler.chat_completion(
-                model="gpt-4o-mini",  # Use faster model for directory discovery
-                system="You are an expert at analyzing repository structures and finding relevant code locations. Always respond with valid JSON.",
-                user=prompt,
+            # Build comprehensive repository context
+            repo_structure = self._get_repository_structure()
+            issue_context = f"Title: {self.issue.title}\nBody: {self.issue.body or 'No description'}"
+            
+            prompt = f"""You are a code analysis expert. Given this GitHub issue and repository structure, identify the most relevant files that need to be examined or modified to fix this issue.
+
+**Issue:**
+{issue_context}
+
+**Repository Structure:**
+{repo_structure}
+
+**Analysis Context:**
+- Issue Type: {analysis.get('issue_type', 'Unknown')}
+- Summary: {analysis.get('summary', 'No summary')}
+- Keywords: {', '.join(analysis.get('keywords', []))}
+
+**Instructions:**
+1. Analyze the issue description and identify what functionality/components are affected
+2. Look at the repository structure to find files that likely contain the relevant code
+3. Focus on files that would need to be modified to fix this specific issue
+4. Prioritize source code files over configuration files
+5. Return ONLY the file paths, one per line, no explanations
+6. Maximum 5 files
+7. Only return files that actually exist in the repository structure shown above
+
+**Response Format:**
+path/to/file1.py
+path/to/file2.js
+path/to/file3.java"""
+
+            response = await ai_handler.chat_completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.1
             )
             
-            # Parse LLM response
-            import json
-            try:
-                result = json.loads(response)
-                directories = result.get("relevant_directories", [])
-                reasoning = result.get("reasoning", "")
-                
-                get_logger().info(f"LLM directory discovery: {directories} - {reasoning}")
-                
-                # Validate directories exist
-                valid_dirs = []
-                for dir_path in directories:
-                    if os.path.isdir(dir_path):
-                        valid_dirs.append(dir_path)
-                
-                return valid_dirs
-                
-            except json.JSONDecodeError:
-                get_logger().warning("Failed to parse LLM directory response")
+            if not response or not hasattr(response, 'choices') or not response.choices:
+                get_logger().warning("LLM file discovery: No response from AI")
                 return []
-                
+            
+            content = response.choices[0].message.content.strip()
+            if not content:
+                get_logger().warning("LLM file discovery: Empty response from AI")
+                return []
+            
+            # Parse file paths from response
+            file_paths = []
+            for line in content.split('\n'):
+                line = line.strip()
+                if line and not line.startswith('#') and not line.startswith('*'):
+                    # Clean up any markdown formatting
+                    if line.startswith('- '):
+                        line = line[2:]
+                    if line.startswith('`') and line.endswith('`'):
+                        line = line[1:-1]
+                    
+                    # Validate file exists and is a code file
+                    if os.path.exists(line) and self._is_valid_code_file(line):
+                        file_paths.append(line)
+                        get_logger().info(f"LLM suggested relevant file: {line}")
+                    else:
+                        get_logger().debug(f"LLM suggested non-existent file: {line}")
+            
+            return file_paths[:5]  # Limit to 5 files
+            
         except Exception as e:
-            get_logger().warning(f"LLM directory discovery failed: {e}")
+            get_logger().exception(f"LLM file discovery failed: {e}")
             return []
 
     def _get_repository_structure(self, max_depth: int = 3) -> str:
@@ -394,52 +353,7 @@ Respond with JSON containing:
             get_logger().warning(f"Failed to get repository structure: {e}")
             return ""
 
-    def _find_files_by_keywords_in_dirs(self, keywords: List[str], directories: List[str]) -> List[str]:
-        """Search for files by keywords within specific directories."""
-        try:
-            import glob
-            files = []
-            
-            for directory in directories:
-                if not os.path.isdir(directory):
-                    continue
-                    
-                # Search within this specific directory
-                for keyword in keywords:
-                    keyword_lower = keyword.lower()
-                    
-                    # Search patterns within the directory
-                    patterns = [
-                        f"{directory}/**/*{keyword_lower}*",
-                        f"{directory}/**/*{keyword_lower.replace('_', '')}*",
-                        f"{directory}/**/*{keyword_lower.replace('-', '')}*"
-                    ]
-                    
-                    for pattern in patterns:
-                        matches = glob.glob(pattern, recursive=True)
-                        files.extend(matches)
-                        
-                    # Also search split keywords
-                    if '_' in keyword_lower or '-' in keyword_lower:
-                        parts = keyword_lower.replace('-', '_').split('_')
-                        for part in parts:
-                            if len(part) > 2:
-                                pattern = f"{directory}/**/*{part}*"
-                                matches = glob.glob(pattern, recursive=True)
-                                files.extend(matches)
-            
-            # Filter and validate files
-            valid_files = []
-            for match in files:
-                if self._is_valid_code_file(match) and os.path.isfile(match):
-                    valid_files.append(match)
-            
-            get_logger().info(f"Found {len(valid_files)} files in targeted directories: {directories}")
-            return list(set(valid_files))  # Remove duplicates
-            
-        except Exception as e:
-            get_logger().warning(f"Targeted directory search failed: {e}")
-            return []
+
 
     async def _create_issue_fix_pr(self, analysis: Dict[str, Any], files: List[str]) -> bool:
         """Create a child PR with the fix for the issue."""
