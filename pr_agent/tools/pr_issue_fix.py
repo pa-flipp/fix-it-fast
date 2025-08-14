@@ -186,7 +186,7 @@ Respond with JSON containing:
             potential_files = re.findall(file_pattern, issue_text)
             
             for file_path in potential_files:
-                if os.path.exists(file_path) and self._is_valid_code_file(file_path):
+                if self._is_valid_target(file_path):
                     files.append(file_path)
                     get_logger().info(f"Found explicitly mentioned file: {file_path}")
             
@@ -195,6 +195,14 @@ Respond with JSON containing:
             if llm_files:
                 files.extend(llm_files)
                 get_logger().info(f"LLM discovered {len(llm_files)} relevant files")
+            
+            # Strategy 3: Fallback keyword-based discovery if LLM found nothing
+            if not llm_files and not files:
+                get_logger().warning("LLM found no files, trying fallback keyword search")
+                fallback_files = await self._fallback_keyword_search(analysis, keywords)
+                if fallback_files:
+                    files.extend(fallback_files)
+                    get_logger().info(f"Fallback search found {len(fallback_files)} files")
             
             # Remove duplicates while preserving order
             seen = set()
@@ -215,9 +223,51 @@ Respond with JSON containing:
             get_logger().exception(f"File discovery failed: {e}")
             return []
 
+    def _is_valid_target(self, path: str) -> bool:
+        """Check if path is a valid target (file or directory) for processing."""
+        try:
+            import os
+            
+            # Normalize path and ensure it's repo-root-relative
+            path = path.strip()
+            if not path or path.startswith('../') or '..' in path:
+                return False
+                
+            # Check if path exists
+            if not os.path.exists(path):
+                return False
+                
+            # Handle directories
+            if os.path.isdir(path):
+                # Check if directory contains tracked files
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        ['git', 'ls-files', path], 
+                        capture_output=True, 
+                        text=True, 
+                        timeout=5
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        return True
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    # Fallback: check if directory has code files
+                    for root, dirs, files in os.walk(path):
+                        for file in files:
+                            if self._is_valid_code_file(file):
+                                return True
+                return False
+                
+            # Handle files
+            return self._is_valid_code_file(path)
+            
+        except Exception as e:
+            get_logger().debug(f"Path validation failed for {path}: {e}")
+            return False
+    
     def _is_valid_code_file(self, file_path: str) -> bool:
         """Check if file path looks like a valid code file."""
-        # Use the same comprehensive list as in file discovery
+        # Code extensions
         code_extensions = [
             '.py', '.js', '.ts', '.tsx', '.jsx',           # Web/Python
             '.java', '.scala', '.sbt', '.gradle',         # JVM languages  
@@ -225,7 +275,26 @@ Respond with JSON containing:
             '.rb', '.php', '.swift', '.kt',               # Other languages
             '.sql', '.yaml', '.yml', '.json', '.toml'     # Config files
         ]
-        return any(file_path.endswith(ext) for ext in code_extensions)
+        
+        # Check extensions
+        if any(file_path.endswith(ext) for ext in code_extensions):
+            return True
+            
+        # Extensionless allowlist
+        extensionless_files = {
+            'Makefile', 'Dockerfile', 'Jenkinsfile', 'Procfile', 
+            'BUILD', 'WORKSPACE', 'CMakeLists.txt'
+        }
+        
+        filename = os.path.basename(file_path)
+        if filename in extensionless_files:
+            return True
+            
+        # Dockerfile variations
+        if filename.startswith('Dockerfile.'):
+            return True
+            
+        return False
 
 
 
@@ -240,7 +309,7 @@ Respond with JSON containing:
             repo_structure = self._get_repository_structure()
             issue_context = f"Title: {self.issue.title}\nBody: {self.issue.body or 'No description'}"
             
-            prompt = f"""You are a code analysis expert. Given this GitHub issue and repository structure, identify the most relevant files that need to be examined or modified to fix this issue.
+            prompt = f"""You are a code analysis expert. Given this GitHub issue and repository structure, identify the most relevant files and directories for fixing this issue.
 
 **Issue:**
 {issue_context}
@@ -253,19 +322,24 @@ Respond with JSON containing:
 - Summary: {analysis.get('summary', 'No summary')}
 - Keywords: {', '.join(analysis.get('keywords', []))}
 
-**Instructions:**
-1. Analyze the issue description and identify what functionality/components are affected
-2. Look at the repository structure to find files that likely contain the relevant code
-3. Focus on files that would need to be modified to fix this specific issue
-4. Prioritize source code files over configuration files
-5. Return ONLY the file paths, one per line, no explanations
-6. Maximum 5 files
-7. Only return files that actually exist in the repository structure shown above
+**File Selection Instructions:**
+- Return at most 10 paths total, repo-root-relative
+- Each path prefixed with "file:" or "dir:" and confidence score
+- No globs, wildcards, or absolute paths
+- Focus on files/directories relating to: {analysis.get('summary', 'this issue')}
+- Prioritize paths containing these keywords: {', '.join(analysis.get('keywords', []))}
+- Prefer specific files; include directories only when they contain multiple relevant files
+- Paths should be chosen to keep final expanded file count under 15
 
-**Response Format:**
-path/to/file1.py
-path/to/file2.js
-path/to/file3.java"""
+**Output Format (each line):**
+file: path/to/specific.scala | 0.92 | contains performance logic
+dir: scala_processing/search_module/ | 0.78 | performance-related module
+
+**Rules:**
+- Only return paths that exist in the repository structure above
+- No explanations outside the format
+- Higher confidence (0.0-1.0) for more relevant paths
+- Include brief reason after confidence score"""
 
             response = await ai_handler.chat_completion(
                 model="gpt-4o-mini",
@@ -283,28 +357,243 @@ path/to/file3.java"""
                 get_logger().warning("LLM file discovery: Empty response from AI")
                 return []
             
-            # Parse file paths from response
-            file_paths = []
-            for line in content.split('\n'):
-                line = line.strip()
-                if line and not line.startswith('#') and not line.startswith('*'):
-                    # Clean up any markdown formatting
-                    if line.startswith('- '):
-                        line = line[2:]
-                    if line.startswith('`') and line.endswith('`'):
-                        line = line[1:-1]
-                    
-                    # Validate file exists and is a code file
-                    if os.path.exists(line) and self._is_valid_code_file(line):
-                        file_paths.append(line)
-                        get_logger().info(f"LLM suggested relevant file: {line}")
-                    else:
-                        get_logger().debug(f"LLM suggested non-existent file: {line}")
+            # Parse structured response
+            files, directories = self._parse_structured_llm_response(content)
+            get_logger().info(f"LLM suggested {len(files)} files and {len(directories)} directories")
             
-            return file_paths[:5]  # Limit to 5 files
+            # Validate and collect all targets
+            valid_targets = []
+            
+            # Add valid files
+            for file_path, confidence, reason in files:
+                if self._is_valid_target(file_path):
+                    valid_targets.append((file_path, confidence, reason, 'file'))
+                    get_logger().info(f"Valid file: {file_path} (confidence: {confidence:.2f})")
+                else:
+                    get_logger().debug(f"Invalid file: {file_path}")
+            
+            # Add valid directories (will be expanded later)
+            for dir_path, confidence, reason in directories:
+                if self._is_valid_target(dir_path):
+                    valid_targets.append((dir_path, confidence, reason, 'directory'))
+                    get_logger().info(f"Valid directory: {dir_path} (confidence: {confidence:.2f})")
+                else:
+                    get_logger().debug(f"Invalid directory: {dir_path}")
+            
+            # Sort by confidence and expand directories
+            valid_targets.sort(key=lambda x: x[1], reverse=True)
+            final_files = await self._expand_targets_to_files(valid_targets, analysis)
+            
+            return final_files[:15]  # Final limit
             
         except Exception as e:
             get_logger().exception(f"LLM file discovery failed: {e}")
+            return []
+
+    def _parse_structured_llm_response(self, response_text: str) -> tuple[list, list]:
+        """Parse structured LLM response with confidence scores."""
+        files, directories = [], []
+        
+        for line in response_text.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+                
+            try:
+                if line.startswith('file:'):
+                    # Parse: file: path/to/file.py | 0.85 | reason
+                    parts = [p.strip() for p in line.split(' | ')]
+                    path = parts[0][5:].strip()  # Remove 'file:'
+                    confidence = float(parts[1]) if len(parts) > 1 else 0.5
+                    reason = parts[2] if len(parts) > 2 else "AI suggested"
+                    files.append((path, confidence, reason))
+                    
+                elif line.startswith('dir:'):
+                    # Parse: dir: path/to/directory | 0.75 | reason
+                    parts = [p.strip() for p in line.split(' | ')]
+                    path = parts[0][4:].strip()  # Remove 'dir:'
+                    confidence = float(parts[1]) if len(parts) > 1 else 0.5
+                    reason = parts[2] if len(parts) > 2 else "AI suggested"
+                    directories.append((path, confidence, reason))
+                    
+            except (ValueError, IndexError) as e:
+                get_logger().debug(f"Failed to parse LLM response line: {line} - {e}")
+                continue
+                
+        return files, directories
+
+    async def _expand_targets_to_files(self, targets: list, analysis: dict) -> list[str]:
+        """Expand directories to files and return final file list."""
+        try:
+            final_files = []
+            keywords = [kw.lower() for kw in analysis.get('keywords', [])]
+            
+            for path, _confidence, _reason, target_type in targets:
+                if target_type == 'file':
+                    # Direct file - add immediately
+                    final_files.append(path)
+                    get_logger().info(f"Added direct file: {path}")
+                    
+                elif target_type == 'directory':
+                    # Expand directory to files
+                    dir_files = self._expand_directory_to_files(path, keywords, max_files=5)
+                    final_files.extend(dir_files)
+                    get_logger().info(f"Expanded directory {path} to {len(dir_files)} files")
+                    
+                # Stop if we've reached our limit
+                if len(final_files) >= 15:
+                    break
+                    
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_files = []
+            for f in final_files:
+                if f not in seen:
+                    seen.add(f)
+                    unique_files.append(f)
+                    
+            return unique_files[:15]
+            
+        except Exception as e:
+            get_logger().exception(f"Target expansion failed: {e}")
+            return []
+
+    def _expand_directory_to_files(self, directory: str, keywords: list[str], max_files: int = 5) -> list[str]:
+        """Expand a single directory to relevant files using git and keyword matching."""
+        try:
+            import subprocess
+            import os
+            
+            # First try git ls-files for tracked files
+            try:
+                result = subprocess.run(
+                    ['git', 'ls-files', directory],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                if result.returncode == 0:
+                    tracked_files = result.stdout.strip().split('\n')
+                    tracked_files = [f for f in tracked_files if f.strip()]
+                else:
+                    tracked_files = []
+                    
+            except (subprocess.SubprocessError, FileNotFoundError):
+                tracked_files = []
+                
+            # Fallback to os.walk if git failed
+            if not tracked_files:
+                for root, dirs, filenames in os.walk(directory):
+                    # Skip common build/cache directories
+                    dirs[:] = [d for d in dirs if d not in {
+                        'target', 'build', 'node_modules', '.git', '.idea', 
+                        '.metals', '.bloop', '.cache', 'dist', '__pycache__'
+                    }]
+                    
+                    for filename in filenames:
+                        file_path = os.path.join(root, filename)
+                        if self._is_valid_code_file(file_path):
+                            tracked_files.append(file_path)
+            
+            # Filter and score files
+            scored_files = []
+            for file_path in tracked_files:
+                if not self._is_valid_code_file(file_path):
+                    continue
+                    
+                # Skip large files
+                try:
+                    if os.path.getsize(file_path) > 500 * 1024:  # 500KB limit
+                        continue
+                except OSError:
+                    continue
+                    
+                # Calculate relevance score
+                score = self._calculate_file_relevance_score(file_path, keywords)
+                scored_files.append((file_path, score))
+                
+            # Sort by score and return top files
+            scored_files.sort(key=lambda x: x[1], reverse=True)
+            result_files = [f[0] for f in scored_files[:max_files]]
+            
+            get_logger().info(f"Directory {directory}: found {len(tracked_files)} files, returning {len(result_files)}")
+            return result_files
+            
+        except Exception as e:
+            get_logger().exception(f"Directory expansion failed for {directory}: {e}")
+            return []
+
+    def _calculate_file_relevance_score(self, file_path: str, keywords: list[str]) -> float:
+        """Calculate relevance score for a file based on keywords."""
+        score = 0.0
+        
+        # Normalize file path for matching
+        normalized_path = file_path.lower().replace('_', ' ').replace('-', ' ').replace('/', ' ')
+        
+        # Keyword matching in path/filename
+        for keyword in keywords:
+            if keyword in normalized_path:
+                score += 1.0
+                
+        # Boost for certain file types based on common patterns
+        if any(ext in file_path for ext in ['.scala', '.java']):
+            score += 0.2
+        if 'test' in file_path and 'test' not in [kw.lower() for kw in keywords]:
+            score -= 0.5  # De-prioritize tests unless explicitly mentioned
+        if any(pattern in file_path for pattern in ['generated', '.min.', 'target/', 'build/']):
+            score -= 1.0  # De-prioritize generated/build files
+            
+        # Boost for main source files
+        if 'src/main' in file_path:
+            score += 0.3
+            
+        return max(0.0, score)  # Ensure non-negative
+
+    async def _fallback_keyword_search(self, analysis: dict, keywords: list[str]) -> list[str]:
+        """Fallback search using git grep and directory scanning when LLM fails."""
+        try:
+            import subprocess
+            
+            fallback_files = []
+            issue_keywords = analysis.get('keywords', []) + keywords
+            
+            # Try git grep for each keyword
+            for keyword in issue_keywords[:3]:  # Limit to top 3 keywords
+                try:
+                    result = subprocess.run(
+                        ['git', 'grep', '-l', '--fixed-strings', keyword],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    
+                    if result.returncode == 0:
+                        grep_files = result.stdout.strip().split('\n')
+                        for file_path in grep_files[:5]:  # Limit per keyword
+                            if file_path and self._is_valid_target(file_path):
+                                fallback_files.append(file_path)
+                                get_logger().info(f"Git grep found: {file_path} (keyword: {keyword})")
+                                
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    continue
+            
+            # If still no files, do a broader directory scan
+            if not fallback_files:
+                get_logger().info("Git grep failed, trying directory scan")
+                common_dirs = ['src', 'lib', 'app', 'main', 'scala_processing', 'python_processing']
+                
+                for dir_name in common_dirs:
+                    if os.path.exists(dir_name) and os.path.isdir(dir_name):
+                        dir_files = self._expand_directory_to_files(dir_name, issue_keywords, max_files=3)
+                        fallback_files.extend(dir_files)
+                        if len(fallback_files) >= 10:  # Don't overwhelm
+                            break
+            
+            return fallback_files[:10]  # Final limit
+            
+        except Exception as e:
+            get_logger().exception(f"Fallback keyword search failed: {e}")
             return []
 
     def _get_repository_structure(self, max_depth: int = 3) -> str:
@@ -331,7 +620,7 @@ path/to/file3.java"""
                             items.append((item, False))
                 
                     # Limit items to avoid overwhelming the LLM
-                    for i, (item, is_dir) in enumerate(items[:max_items]):
+                    for _i, (item, is_dir) in enumerate(items[:max_items]):
                         if is_dir:
                             structure_lines.append(f"{indent}{item}/")
                             if depth < max_depth:
