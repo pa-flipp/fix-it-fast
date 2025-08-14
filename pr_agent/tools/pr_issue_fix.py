@@ -80,6 +80,29 @@ class PRIssueFix:
                     get_logger().error(f"Failed to add no-files-found comment: {comment_err}")
                 return
 
+            # Validate actionable targets before proceeding
+            is_actionable, validation_msg = self._validate_actionable_targets(files, analysis)
+            get_logger().info(f"Actionability validation: {validation_msg}")
+            
+            if not is_actionable:
+                get_logger().warning(f"Skipping PR creation - {validation_msg}")
+                try:
+                    await self.git_provider.publish_comment(
+                        f"❌ **Issue Fix Analysis Complete - Unable to Proceed**\n\n"
+                        f"I analyzed this issue and found relevant files, but they don't meet the criteria for automated fixing:\n\n"
+                        f"**Validation Result:** {validation_msg}\n\n"
+                        f"**Files Found:** {len(files)} files\n"
+                        f"- {', '.join(files[:5])}{'...' if len(files) > 5 else ''}\n\n"
+                        f"**Recommendation:** This issue may require:\n"
+                        f"- Manual investigation and fixes\n"
+                        f"- More specific file targeting\n"
+                        f"- Different automated tools\n\n"
+                        f"Please review the issue requirements and try again with more specific guidance if needed."
+                    )
+                except Exception as comment_err:
+                    get_logger().error(f"Failed to add validation failure comment: {comment_err}")
+                return
+
             # Create child PR with fix
             success = await self._create_issue_fix_pr(analysis, files)
             if success:
@@ -341,6 +364,13 @@ dir: scala_processing/search_module/ | 0.78 | performance-related module
 - Higher confidence (0.0-1.0) for more relevant paths
 - Include brief reason after confidence score"""
 
+            get_logger().info("Calling LLM for file discovery", extra={
+                "model": "gpt-4o-mini",
+                "repo_structure_length": len(repo_structure),
+                "analysis_keywords": analysis.get('keywords', []),
+                "issue_type": analysis.get('issue_type', 'Unknown')
+            })
+
             response = await ai_handler.chat_completion(
                 model="gpt-4o-mini",
                 system="You are a code analysis expert. Analyze GitHub issues and repository structures to identify relevant files for fixing issues.",
@@ -348,18 +378,59 @@ dir: scala_processing/search_module/ | 0.78 | performance-related module
                 temperature=0.1
             )
             
-            if not response or not hasattr(response, 'choices') or not response.choices:
-                get_logger().warning("LLM file discovery: No response from AI")
-                return []
+            # Extract content using robust method for LiteLLM responses
+            content = self._extract_llm_text(response)
+            get_logger().info("LLM response extraction details", extra={
+                "response_type": type(response).__name__,
+                "has_choices": hasattr(response, 'choices'),
+                "content_length": len(content) if content else 0,
+                "content_preview": content[:200] if content else None
+            })
             
-            content = response.choices[0].message.content.strip()
-            if not content:
-                get_logger().warning("LLM file discovery: Empty response from AI")
+            if not content or not content.strip():
+                get_logger().warning("LLM file discovery: Empty content from AI", extra={
+                    "raw_response": str(response)[:500],
+                    "extraction_method": "robust_text_extraction"
+                })
                 return []
             
             # Parse structured response
             files, directories = self._parse_structured_llm_response(content)
-            get_logger().info(f"LLM suggested {len(files)} files and {len(directories)} directories")
+            get_logger().info(f"LLM parsing results", extra={
+                "files_suggested": len(files),
+                "directories_suggested": len(directories),
+                "total_suggestions": len(files) + len(directories),
+                "raw_content_lines": len(content.splitlines()),
+                "first_few_lines": content.splitlines()[:3] if content else []
+            })
+            
+            # Resolve non-existent files to existing directories
+            resolved_files, resolved_dirs = [], []
+            
+            for path, conf, reason in files:
+                if os.path.exists(path) and os.path.isfile(path):
+                    resolved_files.append((path, conf, reason))
+                elif os.path.exists(path) and os.path.isdir(path):
+                    resolved_dirs.append((path, conf, f"File path is directory: {reason}"))
+                    get_logger().info(f"Resolved file {path} as directory")
+                else:
+                    # Try parent directory
+                    parent = os.path.dirname(path)
+                    if parent and os.path.exists(parent) and os.path.isdir(parent):
+                        resolved_dirs.append((parent, conf * 0.8, f"File missing, using parent: {reason}"))
+                        get_logger().info(f"Resolved missing file {path} to parent directory {parent}")
+                    else:
+                        get_logger().debug(f"Skipping non-existent path: {path}")
+
+            for path, conf, reason in directories:
+                if os.path.exists(path) and os.path.isdir(path):
+                    resolved_dirs.append((path, conf, reason))
+                else:
+                    get_logger().debug(f"Skipping non-existent directory: {path}")
+
+            # Use resolved paths
+            files, directories = resolved_files, resolved_dirs
+            get_logger().info(f"Path resolution: {len(files)} valid files, {len(directories)} valid directories")
             
             # Validate and collect all targets
             valid_targets = []
@@ -382,45 +453,181 @@ dir: scala_processing/search_module/ | 0.78 | performance-related module
             
             # Sort by confidence and expand directories
             valid_targets.sort(key=lambda x: x[1], reverse=True)
+            get_logger().info("File discovery target resolution summary", extra={
+                "valid_targets_count": len(valid_targets),
+                "file_targets": sum(1 for t in valid_targets if t[3] == 'file'),
+                "directory_targets": sum(1 for t in valid_targets if t[3] == 'directory'),
+                "top_5_targets": [(t[0], t[1], t[3]) for t in valid_targets[:5]]
+            })
+            
             final_files = await self._expand_targets_to_files(valid_targets, analysis)
+            
+            get_logger().info("Final file discovery results", extra={
+                "final_file_count": len(final_files),
+                "files_after_limit": len(final_files[:15]),
+                "sample_files": final_files[:5] if final_files else []
+            })
             
             return final_files[:15]  # Final limit
             
         except Exception as e:
-            get_logger().exception(f"LLM file discovery failed: {e}")
+            get_logger().exception(f"LLM file discovery failed: {e}", extra={
+                "error_type": type(e).__name__,
+                "repo_structure_available": 'repo_structure' in locals(),
+                "ai_handler_available": ai_handler is not None,
+                "analysis_available": 'analysis' in locals()
+            })
             return []
+
+    def _extract_llm_text(self, response) -> str:
+        """Extract text content from various LLM response formats."""
+        try:
+            if response is None:
+                return ""
+            if isinstance(response, str):
+                return response
+            
+            # LiteLLM/OpenAI format - primary path
+            if hasattr(response, 'choices') and response.choices:
+                choice = response.choices[0]
+                if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
+                    return choice.message.content or ""
+                if hasattr(choice, 'text'):
+                    return choice.text or ""
+            
+            # Alternative attribute access for different SDKs
+            if hasattr(response, 'content'):
+                content = response.content
+                if isinstance(content, list):
+                    # Some SDKs return content as list of blocks
+                    return "".join([str(block.get('text', block)) if isinstance(block, dict) 
+                                  else str(getattr(block, 'text', block)) for block in content])
+                return str(content)
+            
+            # Fallback to string conversion
+            return str(response)
+        except Exception as e:
+            get_logger().debug(f"Error extracting LLM text: {e}", extra={
+                "response_type": type(response).__name__,
+                "error_type": type(e).__name__,
+                "extraction_attempt": "robust_method"
+            })
+            return str(response) if response else ""
 
     def _parse_structured_llm_response(self, response_text: str) -> tuple[list, list]:
         """Parse structured LLM response with confidence scores."""
         files, directories = [], []
         
-        for line in response_text.strip().split('\n'):
-            line = line.strip()
+        # Strip markdown code fences if present
+        text = response_text.strip()
+        if "```" in text:
+            lines = [ln for ln in text.splitlines() if not ln.strip().startswith("```")]
+            text = "\n".join(lines)
+        
+        for line in text.splitlines():
+            line = line.strip().lstrip("-*•").strip()  # Remove bullets and whitespace
             if not line:
                 continue
                 
             try:
-                if line.startswith('file:'):
-                    # Parse: file: path/to/file.py | 0.85 | reason
-                    parts = [p.strip() for p in line.split(' | ')]
-                    path = parts[0][5:].strip()  # Remove 'file:'
-                    confidence = float(parts[1]) if len(parts) > 1 else 0.5
-                    reason = parts[2] if len(parts) > 2 else "AI suggested"
-                    files.append((path, confidence, reason))
+                # Check for file: or dir: prefixes (case insensitive)
+                if line.lower().startswith(('file:', 'dir:')):
+                    # Split into max 3 parts to handle reasons with pipes
+                    parts = line.split(' | ', 2)
                     
-                elif line.startswith('dir:'):
-                    # Parse: dir: path/to/directory | 0.75 | reason
-                    parts = [p.strip() for p in line.split(' | ')]
-                    path = parts[0][4:].strip()  # Remove 'dir:'
-                    confidence = float(parts[1]) if len(parts) > 1 else 0.5
-                    reason = parts[2] if len(parts) > 2 else "AI suggested"
-                    directories.append((path, confidence, reason))
+                    # Extract type and path
+                    type_and_path = parts[0]
+                    if ':' not in type_and_path:
+                        continue
+                        
+                    file_type, path = type_and_path.split(':', 1)
+                    path = path.strip()
                     
+                    # Parse confidence (handle percentage format)
+                    confidence = 0.5
+                    if len(parts) > 1:
+                        conf_str = parts[1].strip()
+                        try:
+                            if conf_str.endswith('%'):
+                                confidence = float(conf_str[:-1]) / 100.0
+                            else:
+                                confidence = float(conf_str)
+                            # Clamp confidence to valid range
+                            confidence = max(0.0, min(1.0, confidence))
+                        except ValueError:
+                            confidence = 0.5
+                    
+                    # Extract reason
+                    reason = parts[2].strip() if len(parts) > 2 else "AI suggested"
+                    
+                    # Classify as file or directory
+                    if file_type.lower().strip() == 'dir' or path.endswith('/'):
+                        path = path.rstrip('/')  # Normalize directory paths
+                        directories.append((path, confidence, reason))
+                    else:
+                        files.append((path, confidence, reason))
+                        
             except (ValueError, IndexError) as e:
-                get_logger().debug(f"Failed to parse LLM response line: {line} - {e}")
+                get_logger().debug(f"Failed to parse LLM response line: {line} - {e}", extra={
+                    "line_content": line,
+                    "error_type": type(e).__name__,
+                    "parsing_stage": "structured_response"
+                })
                 continue
                 
+        get_logger().info(f"LLM parsing: found {len(files)} files, {len(directories)} directories", extra={
+            "parsing_success": True,
+            "files_parsed": [(f[0], f[1]) for f in files[:3]],  # First 3 with confidence
+            "dirs_parsed": [(d[0], d[1]) for d in directories[:3]]
+        })
         return files, directories
+
+    def _validate_actionable_targets(self, files: list[str], analysis: dict) -> tuple[bool, str]:
+        """Ensure we have actionable source code before proceeding."""
+        if not files:
+            return False, "No files provided for validation"
+            
+        source_files = 0
+        has_performance_relevance = False
+        has_scala_files = False
+        issue_type = analysis.get('issue_type', '')
+        
+        for file_path in files:
+            # Count source files
+            if file_path.endswith(('.scala', '.py', '.java', '.kt', '.js', '.ts')):
+                source_files += 1
+                
+                if file_path.endswith('.scala'):
+                    has_scala_files = True
+                    
+                # Check for performance-relevant content
+                try:
+                    if os.path.exists(file_path) and os.path.isfile(file_path):
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read(1000).lower()  # First 1KB, case insensitive
+                            performance_keywords = ['dynamodb', 'batch', 'performance', 'throughput', 
+                                                  'write', 'partition', 'repartition', 'collect', 
+                                                  'foreach', 'spark', 'optimization']
+                            if any(keyword in content for keyword in performance_keywords):
+                                has_performance_relevance = True
+                except Exception as e:
+                    get_logger().debug(f"Could not read file {file_path}: {e}")
+        
+        # Validation rules
+        if source_files < 1:
+            return False, f"Insufficient source files: {source_files} found, need at least 1"
+            
+        # For Scala performance issues, prefer Scala files
+        if 'scala' in self.issue.title.lower() and not has_scala_files:
+            return False, "Issue mentions Scala but no .scala files found"
+            
+        # For performance issues, prefer files with performance-relevant content
+        if issue_type == 'bug_fix' and 'performance' in analysis.get('summary', '').lower():
+            if not has_performance_relevance:
+                get_logger().warning("Performance issue but no performance-relevant keywords found in files")
+                # Don't fail completely, but log the concern
+        
+        return True, f"Validation passed: {source_files} source files, Scala files: {has_scala_files}, Performance relevance: {has_performance_relevance}"
 
     async def _expand_targets_to_files(self, targets: list, analysis: dict) -> list[str]:
         """Expand directories to files and return final file list."""
