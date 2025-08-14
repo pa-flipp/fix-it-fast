@@ -269,7 +269,8 @@ path/to/file3.java"""
 
             response = await ai_handler.chat_completion(
                 model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
+                system="You are a code analysis expert. Analyze GitHub issues and repository structures to identify relevant files for fixing issues.",
+                user=prompt,
                 temperature=0.1
             )
             
